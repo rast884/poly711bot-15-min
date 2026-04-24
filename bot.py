@@ -1,10 +1,8 @@
 """
-PolyBot — BTC 15M Trading Bot
-Логика строго как Polymarket:
-- Ставки только на закрытых 15м свечах Binance: 9:00, 9:15, 9:30 ...
-- Цена входа = close 15м свечи в момент открытия раунда
-- Цена выхода = close следующей 15м свечи (через 15 мин)
-- Токен из Railway Variables, НЕ вшит в код
+PolyBot v4 — синхронизация цены напрямую с Polymarket (Chainlink оракул)
+Источник цены: wss://ws-subscriptions-clob.polymarket.com/ws/market
+topic: crypto_prices_chainlink, symbol: btc/usd
+Это та же цена что отображается на Polymarket как "Целевая цена" и "Текущая цена"
 """
 
 import asyncio
@@ -20,8 +18,8 @@ from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ["TG_TOKEN"]        # Railway Variable — обязательно
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]      # Railway Variable — обязательно
+TG_TOKEN   = os.environ["TG_TOKEN"]
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 START_HOUR = 9
 END_HOUR   = 23
 BET_AMOUNT = 5.0
@@ -32,52 +30,173 @@ log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
 state = {
-    "balance":     100.0,
-    "pnl":         0.0,
-    "bets":        0,
-    "wins":        0,
-    "active_bet":  None,
-    "candles_1m":  [],
-    "candles_15m": [],
-    "last_price":  0.0,
-    "paused":      False,
+    "balance":        100.0,
+    "pnl":            0.0,
+    "bets":           0,
+    "wins":           0,
+    "active_bet":     None,
+    "poly_price":     0.0,      # цена с Polymarket Chainlink WS
+    "poly_history":   [],       # история цен для анализа {ts, price}
+    "slot_open_price": 0.0,     # цена открытия текущего слота (целевая цена)
+    "candles_15m":    [],       # 15м свечи из poly_history
+    "paused":         False,
+    "ws_connected":   False,
 }
 
-# ─── TIME HELPERS ─────────────────────────────────────────────────────────────
-def msk_now() -> datetime:
-    return datetime.now(MSK)
+# ─── TIME ────────────────────────────────────────────────────────────────────
+def msk_now(): return datetime.now(MSK)
+def utc_now(): return datetime.now(timezone.utc)
+def in_trading_hours():
+    t = msk_now(); return START_HOUR <= t.hour < END_HOUR
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-def in_trading_hours() -> bool:
-    t = msk_now()
-    return START_HOUR <= t.hour < END_HOUR
-
-def current_15m_slot(dt: datetime) -> datetime:
+def current_15m_slot(dt):
     dt = dt.replace(second=0, microsecond=0)
     return dt.replace(minute=(dt.minute // 15) * 15)
 
-def next_15m_slot(dt: datetime) -> datetime:
+def next_15m_slot(dt):
     minutes = (dt.minute // 15 + 1) * 15
     if minutes >= 60:
         return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     return dt.replace(minute=minutes, second=0, microsecond=0)
 
-def secs_to_next_slot() -> int:
+def secs_to_next_slot():
     now = utc_now()
     return max(0, int((next_15m_slot(now) - now).total_seconds()))
 
-def fmt_price(p: float) -> str:
-    return f"${p:,.0f}"
+def fmt_price(p): return f"${p:,.2f}"
+def fmt_money(p): return f"+${p:.2f}" if p >= 0 else f"-${abs(p):.2f}"
 
-def fmt_money(p: float) -> str:
-    return f"+${p:.2f}" if p >= 0 else f"-${abs(p):.2f}"
+# ─── POLYMARKET CHAINLINK WEBSOCKET ──────────────────────────────────────────
+async def polymarket_price_ws():
+    """
+    Подключается к Polymarket WebSocket и получает цену BTC/USD от Chainlink.
+    Это та же цена что используется для расчёта на Polymarket.
+    """
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    sub_msg = json.dumps({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": "{\"symbol\":\"btc/usd\"}"
+            }
+        ]
+    })
+
+    while True:
+        try:
+            log.info("Connecting to Polymarket Chainlink WS...")
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=10,
+                open_timeout=15,
+                extra_headers={"User-Agent": "Mozilla/5.0"}
+            ) as ws:
+                await ws.send(sub_msg)
+                state["ws_connected"] = True
+                log.info("Polymarket Chainlink WS connected — receiving BTC/USD price")
+
+                async for raw in ws:
+                    try:
+                        data = json.loads(raw)
+                        # Формат: {"topic":"crypto_prices_chainlink","type":"update",
+                        #          "payload":{"symbol":"btc/usd","value":77765.01,"timestamp":...}}
+                        if isinstance(data, list):
+                            for item in data:
+                                _process_price_msg(item)
+                        else:
+                            _process_price_msg(data)
+                    except Exception as e:
+                        log.warning(f"Price parse error: {e}")
+
+        except Exception as e:
+            state["ws_connected"] = False
+            log.warning(f"Polymarket WS error: {e} — fallback to Binance, retry in 10s")
+            # Fallback: если Polymarket WS недоступен — берём с Binance
+            await _binance_price_fallback()
+            await asyncio.sleep(10)
+
+def _process_price_msg(data):
+    """Обработка сообщения с ценой от Polymarket"""
+    try:
+        topic = data.get("topic", "")
+        if "crypto_prices" not in topic:
+            return
+        payload = data.get("payload", {})
+        if not payload:
+            return
+        symbol = payload.get("symbol", "").lower()
+        if "btc" not in symbol:
+            return
+        price = float(payload.get("value", 0) or payload.get("price", 0))
+        if price <= 0:
+            return
+        ts = payload.get("timestamp", int(utc_now().timestamp() * 1000))
+        state["poly_price"] = price
+        # Записываем в историю для анализа
+        h = state["poly_history"]
+        h.append({"ts": ts, "price": price})
+        if len(h) > 5000:
+            state["poly_history"] = h[-5000:]
+        _update_15m_candles(ts, price)
+        log.debug(f"Polymarket BTC/USD: {fmt_price(price)}")
+    except Exception as e:
+        log.warning(f"_process_price_msg error: {e}")
+
+def _update_15m_candles(ts_ms, price):
+    """Строим 15м свечи из тик-данных Polymarket"""
+    slot_ts = (ts_ms // (15 * 60 * 1000)) * (15 * 60 * 1000)
+    c = state["candles_15m"]
+    if c and c[-1]["t"] == slot_ts:
+        candle = c[-1]
+        candle["h"] = max(candle["h"], price)
+        candle["l"] = min(candle["l"], price)
+        candle["c"] = price
+    else:
+        c.append({"t": slot_ts, "o": price, "h": price, "l": price, "c": price})
+    if len(c) > 50:
+        state["candles_15m"] = c[-50:]
+
+async def _binance_price_fallback():
+    """Запасной источник цены — Binance WebSocket"""
+    try:
+        url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+        async with websockets.connect(url, open_timeout=10) as ws:
+            for _ in range(30):  # 30 тиков и выходим обратно к Polymarket
+                raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                data = json.loads(raw)
+                price = float(data.get("p", 0))
+                if price > 0:
+                    state["poly_price"] = price
+    except Exception as e:
+        log.warning(f"Binance fallback error: {e}")
+
+# ─── FETCH HISTORICAL 15M FROM BINANCE (для начальных данных) ────────────────
+async def fetch_initial_candles():
+    """Загружаем начальные 15м свечи с Binance чтобы был материал для анализа"""
+    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=30"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                for k in data:
+                    slot_ts = int(k[0])
+                    state["candles_15m"].append({
+                        "t": slot_ts,
+                        "o": float(k[1]), "h": float(k[2]),
+                        "l": float(k[3]), "c": float(k[4])
+                    })
+                if state["candles_15m"] and state["poly_price"] == 0:
+                    state["poly_price"] = state["candles_15m"][-1]["c"]
+                log.info(f"Initial 15m candles loaded: {len(state['candles_15m'])}")
+    except Exception as e:
+        log.warning(f"fetch_initial_candles error: {e}")
 
 # ─── ANALYSIS ────────────────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
+    if len(closes) < period + 1: return 50.0
     gains = losses = 0.0
     for i in range(len(closes) - period, len(closes)):
         d = closes[i] - closes[i - 1]
@@ -94,15 +213,15 @@ def calc_macd(closes):
     if len(closes) < 26: return 0.0
     return ema(closes[-12:], 12) - ema(closes[-26:], 26)
 
-def analyze() -> dict:
-    src = state["candles_1m"] if len(state["candles_1m"]) >= 10 else state["candles_15m"]
-    if len(src) < 5:
+def analyze():
+    c = state["candles_15m"]
+    if len(c) < 5:
         return {"dir": "UP", "confidence": 50, "rsi": 50.0, "macd": 0.0, "trend": True}
-    closes = [c["c"] for c in src]
+    closes = [x["c"] for x in c]
     trend = closes[-1] > closes[-5]
     rsi = calc_rsi(closes)
     macd = calc_macd(closes)
-    vol = abs(closes[-1] - closes[-2]) / closes[-2] * 100
+    vol = abs(closes[-1] - closes[-2]) / closes[-2] * 100 if closes[-2] else 0
     score = 0
     if trend:    score += 1
     if rsi < 45: score += 1
@@ -115,61 +234,19 @@ def analyze() -> dict:
         "rsi": round(rsi, 1), "macd": round(macd, 2), "trend": trend
     }
 
-# ─── BINANCE ─────────────────────────────────────────────────────────────────
-async def fetch_15m_candles():
-    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=20"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                state["candles_15m"] = [
-                    {"t": k[0], "o": float(k[1]), "h": float(k[2]),
-                     "l": float(k[3]), "c": float(k[4])}
-                    for k in data
-                ]
-                if state["candles_15m"]:
-                    state["last_price"] = state["candles_15m"][-1]["c"]
-                log.info(f"15m candles: {len(state['candles_15m'])}, last close={fmt_price(state['last_price'])}")
-    except Exception as e:
-        log.warning(f"fetch_15m error: {e}")
-
-async def binance_ws():
-    """WebSocket 1м свечи для анализа"""
-    url = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                log.info("Binance WS 1m connected")
-                async for raw in ws:
-                    k = json.loads(raw)["k"]
-                    candle = {"t": k["t"], "o": float(k["o"]), "h": float(k["h"]),
-                              "l": float(k["l"]), "c": float(k["c"])}
-                    c = state["candles_1m"]
-                    if c and c[-1]["t"] == candle["t"]: c[-1] = candle
-                    else: c.append(candle)
-                    if len(c) > 100: state["candles_1m"] = c[-100:]
-                    state["last_price"] = candle["c"]
-        except Exception as e:
-            log.warning(f"WS error: {e} — retry 5s")
-            await asyncio.sleep(5)
-
-async def get_15m_close_price() -> float:
-    """Цена закрытия завершённой 15м свечи (как Polymarket фиксирует цену)"""
-    await fetch_15m_candles()
-    c = state["candles_15m"]
-    if not c: return state["last_price"] or 93000.0
-    # Предпоследняя свеча — гарантированно закрыта
-    return c[-2]["c"] if len(c) >= 2 else c[-1]["c"]
-
 # ─── TRADING ─────────────────────────────────────────────────────────────────
 async def open_bet(bot: Bot):
     if state["balance"] < BET_AMOUNT:
-        await send_msg(bot, "❌ *Недостаточно средств!* Баланс < $5.")
-        return
-    if state["active_bet"]:
+        await send_msg(bot, "❌ *Недостаточно средств!*"); return
+    if state["active_bet"]: return
+
+    # Цена открытия слота — фиксируем как "целевую цену" (как Polymarket)
+    entry_price = state["poly_price"]
+    if entry_price == 0:
+        log.warning("No price available yet, skipping bet")
         return
 
-    entry_price = await get_15m_close_price()
+    state["slot_open_price"] = entry_price
     analysis = analyze()
     direction = analysis["dir"]
     now_utc = utc_now()
@@ -186,26 +263,27 @@ async def open_bet(bot: Bot):
 
     open_msk  = slot_open.astimezone(MSK).strftime("%H:%M")
     close_msk = slot_close.astimezone(MSK).strftime("%H:%M")
+    src = "🔗 Chainlink" if state["ws_connected"] else "📊 Binance"
     arrow = "🟢 ▲ ВВЕРХ" if direction == "UP" else "🔴 ▼ ВНИЗ"
 
     await send_msg(bot,
         f"📊 *Ставка #{state['bets']} открыта*\n\n"
         f"Направление: {arrow}\n"
         f"Сумма: `$5.00`\n"
-        f"Цена входа \\(close 15м\\): `{fmt_price(entry_price)}`\n"
+        f"Целевая цена: `{fmt_price(entry_price)}` {src}\n"
         f"Слот: `{open_msk} → {close_msk} МСК`\n"
         f"RSI: `{analysis['rsi']}`  MACD: `{analysis['macd']}`\n"
         f"Уверенность: `{analysis['confidence']}%`\n"
         f"Баланс: `${state['balance']:.2f}`\n\n"
         f"⏰ Результат в `{close_msk} МСК`"
     )
-    log.info(f"BET #{state['bets']}: {direction} @ {fmt_price(entry_price)} [{open_msk}→{close_msk}]")
+    log.info(f"BET #{state['bets']}: {direction} entry={fmt_price(entry_price)} [{open_msk}→{close_msk}] src={'Polymarket' if state['ws_connected'] else 'Binance'}")
 
 async def close_bet(bot: Bot):
     bet = state["active_bet"]
     if not bet: return
 
-    exit_price = await get_15m_close_price()
+    exit_price = state["poly_price"] or bet["entry"]
     up  = exit_price > bet["entry"]
     won = (bet["dir"] == "UP" and up) or (bet["dir"] == "DOWN" and not up)
     profit = BET_AMOUNT * 0.88 if won else -BET_AMOUNT
@@ -224,7 +302,9 @@ async def close_bet(bot: Bot):
         f"{result} · Ставка #{bet['num']}\n\n"
         f"Слот: `{open_msk} → {close_msk} МСК`\n"
         f"{'▲ ВВЕРХ' if bet['dir'] == 'UP' else '▼ ВНИЗ'}\n"
-        f"Вход: `{fmt_price(bet['entry'])}` → Выход: `{fmt_price(exit_price)}`\n"
+        f"Целевая цена: `{fmt_price(bet['entry'])}`\n"
+        f"Итоговая цена: `{fmt_price(exit_price)}`\n"
+        f"Разница: `{fmt_price(exit_price - bet['entry'])}` ({'▲' if up else '▼'})\n"
         f"Прибыль: `{fmt_money(profit)}`\n"
         f"Баланс: `${state['balance']:.2f}`\n"
         f"P&L итого: `{fmt_money(state['pnl'])}`\n"
@@ -233,94 +313,101 @@ async def close_bet(bot: Bot):
     log.info(f"CLOSED #{bet['num']}: {'WIN' if won else 'LOSS'} {fmt_price(bet['entry'])}→{fmt_price(exit_price)} {fmt_money(profit)}")
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
-async def send_msg(bot: Bot, text: str):
+async def send_msg(bot, text):
     try:
         await bot.send_message(chat_id=TG_CHAT_ID, text=text, parse_mode="Markdown")
     except Exception as e:
         log.error(f"TG error: {e}")
 
-async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update, context):
     global TG_CHAT_ID
     TG_CHAT_ID = str(update.effective_chat.id)
+    src = "🔗 Chainlink (Polymarket)" if state["ws_connected"] else "📊 Binance (fallback)"
     await update.message.reply_text(
-        "🤖 *PolyBot активен!*\n\n"
-        "Торгую BTC/USD строго по слотам Polymarket.\n"
+        "🤖 *PolyBot v4 активен!*\n\n"
+        f"Источник цены: {src}\n"
         "Ставки: 9:00, 9:15, 9:30... МСК\n"
-        "Цена = close 15м свечи Binance\n\n"
+        "Целевая цена = цена открытия слота\n\n"
         "/status · /bet · /pause · /reset · /analysis",
         parse_mode="Markdown"
     )
 
-async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
-    s    = state
-    t    = msk_now().strftime("%H:%M:%S МСК")
+async def cmd_status(update, context):
+    s = state
+    t = msk_now().strftime("%H:%M:%S МСК")
     secs = secs_to_next_slot()
     m, sc = divmod(secs, 60)
     status = "⏸ ПАУЗА" if s["paused"] else ("✅ АКТИВЕН" if in_trading_hours() else "🌙 ВНЕ ЧАСОВ")
+    src = "🔗 Chainlink" if s["ws_connected"] else "📊 Binance"
     bet_info = "нет"
     if s["active_bet"]:
         b = s["active_bet"]
-        cur = s["last_price"]
-        winning = (b["dir"] == "UP" and cur > b["entry"]) or (b["dir"] == "DOWN" and cur < b["entry"])
+        cur = s["poly_price"]
+        diff = cur - b["entry"]
+        winning = (b["dir"] == "UP" and diff > 0) or (b["dir"] == "DOWN" and diff < 0)
         open_msk  = b["slot_open"].astimezone(MSK).strftime("%H:%M")
         close_msk = b["slot_close"].astimezone(MSK).strftime("%H:%M")
-        bet_info = f"{'▲' if b['dir'] == 'UP' else '▼'} {fmt_price(b['entry'])}→{fmt_price(cur)} {'✅' if winning else '❌'} [{open_msk}-{close_msk}]"
+        bet_info = (
+            f"{'▲' if b['dir'] == 'UP' else '▼'} "
+            f"цель {fmt_price(b['entry'])} | сейчас {fmt_price(cur)} "
+            f"({'✅' if winning else '❌'}) [{open_msk}–{close_msk}]"
+        )
     wr = round(s["wins"] / s["bets"] * 100) if s["bets"] else 0
     await update.message.reply_text(
         f"📊 *Статус PolyBot*\n\n"
         f"Время: `{t}`\n"
-        f"Статус: `{status}`\n\n"
+        f"Статус: `{status}`\n"
+        f"Источник цены: {src}\n\n"
         f"💰 Баланс: `${s['balance']:.2f}`\n"
         f"📈 P&L: `{fmt_money(s['pnl'])}`\n"
         f"🎯 Ставок: `{s['bets']}`  Win rate: `{wr}%`\n"
         f"До след. слота: `{m:02d}:{sc:02d}`\n\n"
+        f"BTC/USD: `{fmt_price(s['poly_price'])}`\n"
         f"Активная ставка: `{bet_info}`",
         parse_mode="Markdown"
     )
 
-async def cmd_bet(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_bet(update, context):
     if not in_trading_hours():
-        await update.message.reply_text("⛔ Ставки только 09:00–23:00 МСК")
-        return
+        await update.message.reply_text("⛔ Ставки только 09:00–23:00 МСК"); return
     if state["active_bet"]:
-        await update.message.reply_text("⚠️ Уже открытая ставка. Дождитесь закрытия слота.")
-        return
+        await update.message.reply_text("⚠️ Уже открытая ставка."); return
     await open_bet(context.bot)
 
-async def cmd_pause(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_pause(update, context):
     state["paused"] = not state["paused"]
-    await update.message.reply_text("⏸ Бот на паузе" if state["paused"] else "▶️ Бот возобновлён")
+    await update.message.reply_text("⏸ Пауза" if state["paused"] else "▶️ Возобновлён")
 
-async def cmd_reset(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_reset(update, context):
     state.update({"balance": 100.0, "pnl": 0.0, "bets": 0, "wins": 0, "active_bet": None, "paused": False})
     await update.message.reply_text("↺ Сброс. Баланс: `$100.00`", parse_mode="Markdown")
 
-async def cmd_analysis(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_analysis(update, context):
     a = analyze()
-    c15 = state["candles_15m"]
-    next_entry = c15[-1]["c"] if c15 else state["last_price"]
+    cur = state["poly_price"]
+    target = state["slot_open_price"]
+    diff = cur - target if target else 0
     secs = secs_to_next_slot()
     m, s2 = divmod(secs, 60)
-    pred  = "▲ ВВЕРХ" if a["dir"] == "UP" else "▼ ВНИЗ"
-    trend = "▲ Восходящий" if a["trend"] else "▼ Нисходящий"
+    src = "🔗 Chainlink (Polymarket)" if state["ws_connected"] else "📊 Binance (fallback)"
     await update.message.reply_text(
-        f"🔍 *Анализ BTC*\n\n"
-        f"Цена сейчас: `{fmt_price(state['last_price'])}`\n"
-        f"Цена входа след. ставки: `{fmt_price(next_entry)}`\n"
-        f"Тренд: `{trend}`\n"
-        f"RSI\\(14\\): `{a['rsi']}`\n"
+        f"🔍 *Анализ BTC — {src}*\n\n"
+        f"Целевая цена слота: `{fmt_price(target) if target else 'ждём открытия'}`\n"
+        f"Текущая цена: `{fmt_price(cur)}`\n"
+        f"Разница: `{fmt_price(diff)}` ({'▲' if diff >= 0 else '▼'})\n\n"
+        f"Тренд: `{'▲ Восходящий' if a['trend'] else '▼ Нисходящий'}`\n"
+        f"RSI(14): `{a['rsi']}`\n"
         f"MACD: `{a['macd']}`\n\n"
-        f"Прогноз: *{pred}*\n"
+        f"Прогноз: *{'▲ ВВЕРХ' if a['dir'] == 'UP' else '▼ ВНИЗ'}*\n"
         f"Уверенность: `{a['confidence']}%`\n\n"
         f"До слота: `{m:02d}:{s2:02d}`",
         parse_mode="Markdown"
     )
 
-# ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
-async def trading_loop(bot: Bot):
-    """Ждёт точного момента 15м слота, открывает/закрывает ставки как Polymarket"""
-    log.info("Trading loop started")
-    await asyncio.sleep(5)
+# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+async def trading_loop(bot):
+    log.info("Trading loop started — waiting for first 15m slot")
+    await asyncio.sleep(8)
 
     while True:
         now = utc_now()
@@ -329,7 +416,6 @@ async def trading_loop(bot: Bot):
         log.info(f"Next slot: {nxt.astimezone(MSK).strftime('%H:%M МСК')} — wait {wait:.0f}s")
         await asyncio.sleep(max(0, wait - 0.5))
 
-        # Финальная точная синхронизация
         now = utc_now()
         nxt = next_15m_slot(now)
         precise = (nxt - now).total_seconds()
@@ -337,38 +423,33 @@ async def trading_loop(bot: Bot):
             await asyncio.sleep(precise)
 
         slot_msk = utc_now().astimezone(MSK).strftime("%H:%M")
-        log.info(f"SLOT TICK at {slot_msk} МСК")
+        log.info(f"SLOT TICK at {slot_msk} МСК | BTC={fmt_price(state['poly_price'])}")
 
-        # Закрыть предыдущую ставку если есть
         if state["active_bet"]:
             await close_bet(bot)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-        # Открыть новую если в рабочих часах и не пауза
         if not state["paused"] and in_trading_hours():
             await open_bet(bot)
 
-async def daily_report(bot: Bot):
+async def daily_report(bot):
     while True:
         now = msk_now()
         target = now.replace(hour=END_HOUR, minute=0, second=5, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
+        if now >= target: target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
-        s  = state
+        s = state
         wr = round(s["wins"] / s["bets"] * 100) if s["bets"] else 0
         await send_msg(bot,
-            f"🌙 *Торговый день завершён*\n\n"
+            f"🌙 *День завершён*\n\n"
             f"💰 Баланс: `${s['balance']:.2f}`\n"
             f"📈 P&L: `{fmt_money(s['pnl'])}`\n"
-            f"🎯 Ставок: `{s['bets']}`\n"
-            f"✅ Win rate: `{wr}%`\n\n"
+            f"🎯 Ставок: `{s['bets']}`  Win rate: `{wr}%`\n\n"
             f"До встречи в 09:00 МСК 🤖"
         )
 
 async def main():
-    log.info("Starting PolyBot...")
-    # Не логируем токен — он виден в Railway Logs
+    log.info("Starting PolyBot v4...")
     log.info(f"TG_TOKEN: {'SET (len=' + str(len(TG_TOKEN)) + ')' if TG_TOKEN else 'MISSING'}")
     log.info(f"TG_CHAT_ID: {TG_CHAT_ID}")
 
@@ -388,24 +469,28 @@ async def main():
     async with app:
         await app.start()
         bot = app.bot
-        await fetch_15m_candles()
+
+        # Загружаем начальные данные
+        await fetch_initial_candles()
+
         await send_msg(bot,
-            f"🚀 *PolyBot v2 запущен!*\n\n"
+            f"🚀 *PolyBot v4 запущен!*\n\n"
             f"Баланс: `$100.00`\n"
-            f"Ставки: `$5.00` по слотам 9:00, 9:15, 9:30... МСК\n"
-            f"Цена = close 15м свечи Binance \\(как Polymarket\\)\n\n"
+            f"Источник цены: 🔗 Polymarket Chainlink WS\n"
+            f"Ставки: `$5.00` по слотам 9:00, 9:15... МСК\n\n"
             f"/status — текущий статус"
         )
+
         await asyncio.gather(
             app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"],
-            read_timeout=10,
-            write_timeout=10,
-            connect_timeout=10,
-            pool_timeout=10,
-        ),
-            binance_ws(),
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+                read_timeout=10,
+                write_timeout=10,
+                connect_timeout=10,
+                pool_timeout=10,
+            ),
+            polymarket_price_ws(),   # основной источник цены — Polymarket Chainlink
             trading_loop(bot),
             daily_report(bot),
         )
