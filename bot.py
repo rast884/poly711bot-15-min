@@ -368,10 +368,16 @@ async def daily_report(bot: Bot):
 
 async def main():
     log.info("Starting PolyBot...")
-    log.info(f"TG_TOKEN: {'SET' if TG_TOKEN else 'MISSING'}")
+    # Не логируем токен — он виден в Railway Logs
+    log.info(f"TG_TOKEN: {'SET (len=' + str(len(TG_TOKEN)) + ')' if TG_TOKEN else 'MISSING'}")
     log.info(f"TG_CHAT_ID: {TG_CHAT_ID}")
 
-    app = Application.builder().token(TG_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TG_TOKEN)
+        .concurrent_updates(False)
+        .build()
+    )
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("bet",      cmd_bet))
@@ -391,7 +397,14 @@ async def main():
             f"/status — текущий статус"
         )
         await asyncio.gather(
-            app.updater.start_polling(drop_pending_updates=True),
+            app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
+            pool_timeout=10,
+        ),
             binance_ws(),
             trading_loop(bot),
             daily_report(bot),
