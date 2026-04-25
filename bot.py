@@ -1,50 +1,44 @@
 """
-PolyBot v5 — Professional BTC 15M Trading Bot
-- Цена: парсинг Polymarket напрямую (их внутренний API)
-- Стратегия: 6 индикаторов, взвешенное голосование, всегда ставит
-- Веб-дашборд: /dashboard на порту 8080
-- Telegram: меню + /stop команда
+PolyBot v6
+Цена: Chainlink BTC/USD на Polygon (тот же оракул что Polymarket)
+      wss://polygon-bor-rpc.publicnode.com → latestRoundData()
+      Fallback: Coinbase WS → Binance WS
+Дашборд: полный редизайн в стиле Polymarket, обновление каждую секунду
 """
 
-import asyncio, json, logging, os, math, time
+import asyncio, json, logging, os, math, struct, time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from threading import Thread
 from flask import Flask, jsonify, render_template_string
 
 import aiohttp, websockets
-from telegram import Bot, BotCommand, MenuButtonCommands
+from telegram import Bot, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.environ["TG_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 START_HOUR, END_HOUR = 9, 23
 BET_AMOUNT = 5.0
-MSK        = ZoneInfo("Europe/Moscow")
-PORT       = int(os.environ.get("PORT", 8080))
+MSK = ZoneInfo("Europe/Moscow")
+PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
 state = {
     "balance": 100.0, "pnl": 0.0, "bets": 0, "wins": 0,
     "active_bet": None,
-    "price": 0.0,           # текущая цена с Polymarket
-    "price_source": "—",    # откуда цена
-    "candles_15m": [],      # 15м свечи
-    "candles_1m": [],       # 1м свечи для анализа
+    "price": 0.0, "price_source": "—", "price_ts": 0,
+    "candles_15m": [], "ticks": [],  # ticks для графика реального времени
     "paused": False, "stopped": False,
-    "history": [],          # история ставок для дашборда
-    "last_analysis": {},
-    "ws_ok": False,
+    "history": [], "last_analysis": {},
 }
 
-# ── TIME UTILS ────────────────────────────────────────────────────────────────
+# ── TIME ──────────────────────────────────────────────────────────────────────
 def msk_now(): return datetime.now(MSK)
 def utc_now(): return datetime.now(timezone.utc)
-def in_hours(): t = msk_now(); return START_HOUR <= t.hour < END_HOUR
+def in_hours(): t=msk_now(); return START_HOUR<=t.hour<END_HOUR
 def slot15(dt): dt=dt.replace(second=0,microsecond=0); return dt.replace(minute=(dt.minute//15)*15)
 def next_slot(dt):
     m=(dt.minute//15+1)*15
@@ -53,7 +47,7 @@ def secs_to_next(): return max(0,int((next_slot(utc_now())-utc_now()).total_seco
 def fmt(p): return f"${p:,.2f}"
 def fmtm(p): return f"+${p:.2f}" if p>=0 else f"-${abs(p):.2f}"
 
-# ── STRATEGY: 6 INDICATORS ────────────────────────────────────────────────────
+# ── STRATEGY ──────────────────────────────────────────────────────────────────
 def ema(prices, p):
     if not prices: return 0
     k=2/(p+1); e=prices[0]
@@ -63,264 +57,224 @@ def ema(prices, p):
 def rsi(closes, p=14):
     if len(closes)<p+1: return 50.0
     g=l=0.0
-    for i in range(len(closes)-p, len(closes)):
+    for i in range(len(closes)-p,len(closes)):
         d=closes[i]-closes[i-1]
         if d>0: g+=d
         else: l+=abs(d)
-    rs=g/(l or 0.001); return 100-100/(1+rs)
+    return 100-100/(1+(g/(l or 0.001)))
 
 def macd(closes):
     if len(closes)<26: return 0,0,0
-    macd_line=ema(closes[-12:],12)-ema(closes,26)
-    # approx signal
+    ml=ema(closes[-12:],12)-ema(closes,26)
     sigs=[]
-    for i in range(9,len(closes)+1):
+    for i in range(26,len(closes)+1):
         s=closes[max(0,i-26):i]
-        if len(s)>=12: sigs.append(ema(s[-12:],12)-(ema(s,26) if len(s)>=26 else ema(s[-12:],12)))
-    sig=ema(sigs[-9:],9) if len(sigs)>=9 else macd_line
-    return macd_line, sig, macd_line-sig
+        sigs.append(ema(s[-12:],12)-ema(s,26))
+    sig=ema(sigs[-9:],9) if len(sigs)>=9 else ml
+    return ml,sig,ml-sig
 
-def bollinger(closes, p=20, k=2.0):
+def bollinger(closes,p=20,k=2.0):
     if len(closes)<p: v=closes[-1]; return v,v*1.01,v*0.99
     r=closes[-p:]; mid=sum(r)/p
     std=math.sqrt(sum((x-mid)**2 for x in r)/p)
-    return mid, mid+k*std, mid-k*std
+    return mid,mid+k*std,mid-k*std
 
-def atr(candles, p=14):
+def atr_val(candles,p=14):
     if len(candles)<2: return 0
-    trs=[max(candles[i]["h"]-candles[i]["l"],
-             abs(candles[i]["h"]-candles[i-1]["c"]),
-             abs(candles[i]["l"]-candles[i-1]["c"]))
-         for i in range(1,len(candles))]
-    return sum(trs[-p:])/len(trs[-p:]) if trs else 0
+    trs=[max(candles[i]["h"]-candles[i]["l"],abs(candles[i]["h"]-candles[i-1]["c"]),abs(candles[i]["l"]-candles[i-1]["c"])) for i in range(1,len(candles))]
+    r=trs[-p:]; return sum(r)/len(r) if r else 0
 
-def stochastic(candles, k_period=14):
-    if len(candles)<k_period: return 50,50
-    recent=candles[-k_period:]
-    lo=min(c["l"] for c in recent); hi=max(c["h"] for c in recent)
-    if hi==lo: return 50,50
-    k_val=(candles[-1]["c"]-lo)/(hi-lo)*100
-    # %D = SMA3 of %K (approx)
-    return k_val, k_val
+def stoch(candles,k=14):
+    if len(candles)<k: return 50
+    r=candles[-k:]; lo=min(c["l"] for c in r); hi=max(c["h"] for c in r)
+    return (candles[-1]["c"]-lo)/(hi-lo)*100 if hi!=lo else 50
 
 def analyze(candles_15m, price=None):
-    """
-    6 индикаторов → взвешенное голосование.
-    Всегда возвращает UP или DOWN + уверенность.
-    """
-    if len(candles_15m) < 6:
-        return {"dir":"UP","confidence":50,"details":{},"score":0}
+    if len(candles_15m)<6: return {"dir":"UP","confidence":52,"details":{},"score":0,"rsi":50}
+    closes=[c["c"] for c in candles_15m]; p=price or closes[-1]
+    score=0; details={}
 
-    closes=[c["c"] for c in candles_15m]
-    p=price or closes[-1]
-    score=0  # положительный = UP, отрицательный = DOWN
-    details={}
-
-    # 1. EMA TREND (вес 2)
+    # 1. EMA trend (w=2)
     e9=ema(closes,9); e21=ema(closes,21); e55=ema(closes,min(55,len(closes)))
-    if e9>e21>e55: score+=2; details["EMA"]="▲ Бычий (9>21>55)"
-    elif e9<e21<e55: score-=2; details["EMA"]="▼ Медвежий (9<21<55)"
-    elif e9>e21: score+=1; details["EMA"]="↗ Слабый бычий"
-    else: score-=1; details["EMA"]="↘ Слабый медвежий"
+    if e9>e21>e55: score+=2; details["EMA Тренд"]="▲ Сильный бычий (9>21>55)"
+    elif e9<e21<e55: score-=2; details["EMA Тренд"]="▼ Сильный медвежий (9<21<55)"
+    elif e9>e21: score+=1; details["EMA Тренд"]="↗ Слабый бычий"
+    else: score-=1; details["EMA Тренд"]="↘ Слабый медвежий"
 
-    # 2. RSI (вес 2)
+    # 2. RSI (w=2)
     r=rsi(closes,14)
-    details["RSI"]=f"{r:.1f}"
-    if r<35: score+=2; details["RSI"]+=" ← перепродан ▲"
-    elif r<45: score+=1; details["RSI"]+=" ← умеренно слабый ▲"
-    elif r>65: score-=2; details["RSI"]+=" ← перекуплен ▼"
-    elif r>55: score-=1; details["RSI"]+=" ← умеренно сильный ▼"
+    if r<35: score+=2; details["RSI"]=f"{r:.1f} ← перепродан ▲"
+    elif r<45: score+=1; details["RSI"]=f"{r:.1f} ← слабый ▲"
+    elif r>65: score-=2; details["RSI"]=f"{r:.1f} ← перекуплен ▼"
+    elif r>55: score-=1; details["RSI"]=f"{r:.1f} ← слабый ▼"
+    else: details["RSI"]=f"{r:.1f} нейтрально"
 
-    # 3. MACD (вес 2)
+    # 3. MACD (w=2)
     ml,sl,hist=macd(closes)
-    if ml>sl and hist>0: score+=2; details["MACD"]=f"▲ Бычье пересечение (hist={hist:.0f})"
-    elif ml<sl and hist<0: score-=2; details["MACD"]=f"▼ Медвежье пересечение (hist={hist:.0f})"
-    elif ml>sl: score+=1; details["MACD"]="↗ MACD выше сигнала"
-    else: score-=1; details["MACD"]="↘ MACD ниже сигнала"
+    if ml>sl and hist>0: score+=2; details["MACD"]=f"▲ Бычье (hist={hist:+.0f})"
+    elif ml<sl and hist<0: score-=2; details["MACD"]=f"▼ Медвежье (hist={hist:+.0f})"
+    elif ml>sl: score+=1; details["MACD"]=f"↗ Выше сигнала"
+    else: score-=1; details["MACD"]=f"↘ Ниже сигнала"
 
-    # 4. BOLLINGER BANDS (вес 1)
+    # 4. Bollinger (w=1)
     bb_mid,bb_up,bb_lo=bollinger(closes,20)
-    if p<bb_lo: score+=1; details["BB"]=f"▲ Ниже нижней ({bb_lo:.0f})"
-    elif p>bb_up: score-=1; details["BB"]=f"▼ Выше верхней ({bb_up:.0f})"
+    pos=(p-bb_lo)/(bb_up-bb_lo)*100 if bb_up!=bb_lo else 50
+    if p<bb_lo: score+=1; details["Bollinger"]=f"▲ Ниже нижней (pos={pos:.0f}%)"
+    elif p>bb_up: score-=1; details["Bollinger"]=f"▼ Выше верхней (pos={pos:.0f}%)"
     else:
-        pos=(p-bb_lo)/(bb_up-bb_lo)*100 if bb_up!=bb_lo else 50
-        details["BB"]=f"В канале {pos:.0f}%"
-        if pos<30: score+=1
-        elif pos>70: score-=1
+        if pos<35: score+=1; details["Bollinger"]=f"↗ Нижняя зона ({pos:.0f}%)"
+        elif pos>65: score-=1; details["Bollinger"]=f"↘ Верхняя зона ({pos:.0f}%)"
+        else: details["Bollinger"]=f"Середина ({pos:.0f}%)"
 
-    # 5. STOCHASTIC (вес 1)
-    sk,sd=stochastic(candles_15m,14)
-    details["Stoch"]=f"K={sk:.1f}"
-    if sk<20: score+=1; details["Stoch"]+=" ← перепродан ▲"
-    elif sk>80: score-=1; details["Stoch"]+=" ← перекуплен ▼"
+    # 5. Stochastic (w=1)
+    sk=stoch(candles_15m,14)
+    if sk<20: score+=1; details["Stoch"]=f"K={sk:.0f} ← перепродан ▲"
+    elif sk>80: score-=1; details["Stoch"]=f"K={sk:.0f} ← перекуплен ▼"
+    else: details["Stoch"]=f"K={sk:.0f} нейтрально"
 
-    # 6. MOMENTUM: сила последних 3 свечей (вес 2)
+    # 6. Momentum (w=2)
     if len(candles_15m)>=4:
         last=candles_15m[-4:]
         bull=sum(1 for i in range(1,4) if last[i]["c"]>last[i-1]["c"])
-        move=abs(closes[-1]-closes[-4])
-        a_val=atr(candles_15m,14)
-        rel=move/a_val if a_val>0 else 0
-        if bull>=3 and rel>0.5: score+=2; details["Mom"]=f"▲ Сильный импульс (3/3 бычьих, move={rel:.1f}x ATR)"
-        elif bull==0 and rel>0.5: score-=2; details["Mom"]=f"▼ Сильный импульс (3/3 медвежьих, move={rel:.1f}x ATR)"
-        elif bull>=2: score+=1; details["Mom"]=f"↗ Умеренный бычий ({bull}/3)"
-        else: score-=1; details["Mom"]=f"↘ Умеренный медвежий ({bull}/3)"
+        move=abs(closes[-1]-closes[-4]); a=atr_val(candles_15m,14); rel=move/a if a>0 else 0
+        if bull>=3 and rel>0.4: score+=2; details["Моментум"]=f"▲ Сильный бычий ({bull}/3, {rel:.1f}x ATR)"
+        elif bull==0 and rel>0.4: score-=2; details["Моментум"]=f"▼ Сильный медвежий ({bull}/3, {rel:.1f}x ATR)"
+        elif bull>=2: score+=1; details["Моментум"]=f"↗ Умеренный бычий ({bull}/3)"
+        else: score-=1; details["Моментум"]=f"↘ Умеренный медвежий ({bull}/3)"
 
-    # Итог: максимум ±10 очков
-    max_score=10
-    confidence=int(50+abs(score)/max_score*42)  # 50..92%
-    confidence=min(92,max(52,confidence))
-    direction="UP" if score>=0 else "DOWN"
-    return {"dir":direction,"confidence":confidence,"details":details,"score":score,"rsi":r,"macd_hist":hist}
+    conf=min(92,max(52,int(50+abs(score)/10*42)))
+    return {"dir":"UP" if score>=0 else "DOWN","confidence":conf,"details":details,"score":score,"rsi":r}
 
-# ── PRICE: POLYMARKET DIRECT ──────────────────────────────────────────────────
-async def get_polymarket_price():
-    """
-    Получаем цену напрямую с Polymarket.
-    Сначала пробуем их внутренний API событий BTC,
-    затем их CLOB WebSocket, затем Binance как резерв.
-    """
-    # Метод 1: Polymarket Gamma API (публичный)
-    try:
-        url = "https://gamma-api.polymarket.com/markets?tag=bitcoin&closed=false&limit=5"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=5),
-                             headers={"User-Agent":"Mozilla/5.0","Referer":"https://polymarket.com"}) as r:
-                if r.status==200:
-                    data=await r.json()
-                    for m in data:
-                        desc=str(m.get("description","")).lower()+str(m.get("question","")).lower()
-                        if "bitcoin" in desc or "btc" in desc:
-                            outcomes=m.get("outcomes","[]")
-                            if isinstance(outcomes,str): outcomes=json.loads(outcomes)
-                            prices=m.get("outcomePrices","[]")
-                            if isinstance(prices,str): prices=json.loads(prices)
-                            log.info(f"Polymarket market found: {m.get('question','')[:60]}")
-    except: pass
+# ── PRICE: CHAINLINK ON POLYGON (exact Polymarket oracle) ─────────────────────
+CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+POLYGON_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+]
 
-    # Метод 2: Polymarket CLOB REST
-    try:
-        markets_url = "https://clob.polymarket.com/markets?next_cursor=&limit=10"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(markets_url, timeout=aiohttp.ClientTimeout(total=5),
-                             headers={"User-Agent":"Mozilla/5.0"}) as r:
-                if r.status==200:
-                    data=await r.json()
-                    log.info(f"CLOB markets: {str(data)[:200]}")
-    except Exception as e:
-        log.debug(f"CLOB API: {e}")
-
-    # Метод 3: Coinbase (оракул Polymarket использует Chainlink который агрегирует Coinbase/Kraken/Binance)
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://api.coinbase.com/v2/prices/BTC-USD/spot",
-                             timeout=aiohttp.ClientTimeout(total=5),
-                             headers={"User-Agent":"Mozilla/5.0"}) as r:
-                if r.status==200:
+async def fetch_chainlink_price() -> float:
+    """Читает BTC/USD прямо из Chainlink контракта на Polygon — точная цена Polymarket"""
+    payload = json.dumps({
+        "jsonrpc":"2.0","method":"eth_call",
+        "params":[{"to":CHAINLINK_BTC_USD_POLYGON,"data":"0xfedb2b40"},"latest"],
+        "id":1
+    })
+    for rpc in POLYGON_RPCS:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(rpc, data=payload,
+                    headers={"Content-Type":"application/json"},
+                    timeout=aiohttp.ClientTimeout(total=4)) as r:
                     d=await r.json()
-                    price=float(d["data"]["amount"])
-                    state["price"]=price; state["price_source"]="Coinbase (Chainlink feed)"
-                    log.info(f"Price from Coinbase: {fmt(price)}")
-                    return price
-    except Exception as e:
-        log.debug(f"Coinbase: {e}")
+                    result=d.get("result","")
+                    if result and len(result)>66:
+                        answer_hex=result[2+64:2+128]
+                        price=int(answer_hex,16)/1e8
+                        if 10000<price<1000000:
+                            state["price"]=price
+                            state["price_source"]="Chainlink ✓ (Polymarket оракул)"
+                            state["price_ts"]=int(time.time())
+                            log.info(f"Chainlink BTC/USD: {fmt(price)}")
+                            return price
+        except Exception as e:
+            log.debug(f"RPC {rpc}: {e}")
+    return 0.0
 
-    # Метод 4: Binance REST
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-                             timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status==200:
-                    d=await r.json()
-                    price=float(d["price"])
-                    state["price"]=price; state["price_source"]="Binance"
-                    return price
-    except Exception as e:
-        log.debug(f"Binance REST: {e}")
+async def chainlink_price_loop():
+    """Опрашивает Chainlink каждую секунду"""
+    while not state["stopped"]:
+        p = await fetch_chainlink_price()
+        if p>0:
+            _push_tick(p)
+            _update_15m(p)
+        await asyncio.sleep(1)
 
-    return state["price"]  # вернуть последнюю известную
+def _push_tick(price):
+    ts=int(time.time()*1000)
+    t=state["ticks"]
+    t.append({"ts":ts,"p":price})
+    # Держим тики за последние 20 минут
+    cutoff=ts-20*60*1000
+    state["ticks"]=[x for x in t if x["ts"]>cutoff]
 
-async def price_loop():
-    """WebSocket потоки + периодическое обновление"""
-    async def binance_ws():
-        url="wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
-        while not state["stopped"]:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    state["ws_ok"]=True
-                    log.info("Binance WS connected")
-                    async for raw in ws:
-                        if state["stopped"]: break
-                        k=json.loads(raw)["k"]
-                        p=float(k["c"])
+def _update_15m(price):
+    ts_ms=int(time.time()*1000)
+    slot_ts=(ts_ms//(15*60*1000))*(15*60*1000)
+    c15=state["candles_15m"]
+    if c15 and c15[-1]["t"]==slot_ts:
+        c15[-1]["h"]=max(c15[-1]["h"],price)
+        c15[-1]["l"]=min(c15[-1]["l"],price)
+        c15[-1]["c"]=price
+    else:
+        c15.append({"t":slot_ts,"o":price,"h":price,"l":price,"c":price})
+    if len(c15)>100: state["candles_15m"]=c15[-100:]
+
+async def fallback_price_loop():
+    """Coinbase WS → Binance WS как резерв если Chainlink недоступен"""
+    while not state["stopped"]:
+        # Если Chainlink работал последние 5 сек — не нужен fallback
+        if time.time()-state["price_ts"]<5 and state["price"]>0:
+            await asyncio.sleep(2); continue
+
+        log.warning("Chainlink unavailable, using Coinbase WS fallback")
+        try:
+            url="wss://advanced-trade-ws.coinbase.com"
+            sub={"type":"subscribe","product_ids":["BTC-USD"],"channel":"ticker"}
+            async with websockets.connect(url,ping_interval=20) as ws:
+                await ws.send(json.dumps(sub))
+                async for raw in ws:
+                    if state["stopped"]: return
+                    if time.time()-state["price_ts"]<3: break  # Chainlink вернулся
+                    d=json.loads(raw)
+                    if d.get("channel")=="ticker":
+                        for ev in d.get("events",[]):
+                            for tick in ev.get("tickers",[]):
+                                p=float(tick.get("price",0) or 0)
+                                if p>0:
+                                    state["price"]=p
+                                    state["price_source"]="Coinbase WS (fallback)"
+                                    state["price_ts"]=int(time.time())
+                                    _push_tick(p); _update_15m(p)
+        except Exception as e:
+            log.warning(f"Coinbase WS: {e}")
+
+        # Try Binance WS as second fallback
+        try:
+            async with websockets.connect("wss://stream.binance.com:9443/ws/btcusdt@trade",ping_interval=20) as ws:
+                async for raw in ws:
+                    if state["stopped"]: return
+                    if time.time()-state["price_ts"]<3: break
+                    d=json.loads(raw)
+                    p=float(d.get("p",0))
+                    if p>0:
                         state["price"]=p
-                        state["price_source"]="Binance WS"
-                        candle={"t":k["t"],"o":float(k["o"]),"h":float(k["h"]),"l":float(k["l"]),"c":p}
-                        c=state["candles_1m"]
-                        if c and c[-1]["t"]==candle["t"]: c[-1]=candle
-                        else: c.append(candle)
-                        if len(c)>200: state["candles_1m"]=c[-200:]
-                        # Build 15m candles from 1m
-                        slot_ts=(candle["t"]//(15*60*1000))*(15*60*1000)
-                        c15=state["candles_15m"]
-                        if c15 and c15[-1]["t"]==slot_ts:
-                            c15[-1]["h"]=max(c15[-1]["h"],p)
-                            c15[-1]["l"]=min(c15[-1]["l"],p)
-                            c15[-1]["c"]=p
-                        else:
-                            c15.append({"t":slot_ts,"o":p,"h":p,"l":p,"c":p})
-                        if len(c15)>100: state["candles_15m"]=c15[-100:]
-            except Exception as e:
-                state["ws_ok"]=False
-                log.warning(f"WS error: {e}, retry 5s")
-                await asyncio.sleep(5)
+                        state["price_source"]="Binance WS (fallback)"
+                        state["price_ts"]=int(time.time())
+                        _push_tick(p); _update_15m(p)
+        except Exception as e:
+            log.warning(f"Binance WS: {e}")
+            await asyncio.sleep(3)
 
-    async def coinbase_ws():
-        """Polymarket использует Chainlink который берёт цену с Coinbase Pro"""
-        url="wss://advanced-trade-ws.coinbase.com"
-        sub={"type":"subscribe","product_ids":["BTC-USD"],"channel":"ticker"}
-        while not state["stopped"]:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    await ws.send(json.dumps(sub))
-                    log.info("Coinbase WS connected — Polymarket oracle source")
-                    state["price_source"]="Coinbase (Polymarket оракул)"
-                    async for raw in ws:
-                        if state["stopped"]: break
-                        d=json.loads(raw)
-                        if d.get("channel")=="ticker":
-                            for ev in d.get("events",[]):
-                                for tick in ev.get("tickers",[]):
-                                    p=float(tick.get("price",0) or 0)
-                                    if p>0:
-                                        state["price"]=p
-                                        state["price_source"]="Coinbase ✓ (Polymarket оракул)"
-                                        state["ws_ok"]=True
-            except Exception as e:
-                log.warning(f"Coinbase WS: {e}, fallback to Binance WS")
-                await asyncio.sleep(3)
-                break  # fall through to binance_ws
-
-    # Try Coinbase first (same as Polymarket oracle), fallback to Binance
-    await asyncio.gather(
-        coinbase_ws(),
-        binance_ws(),
-    )
-
-async def load_initial_candles():
-    """Загрузить исторические 15м свечи для анализа"""
+async def load_initial():
+    for rpc in POLYGON_RPCS:
+        p=await fetch_chainlink_price()
+        if p>0: break
+    # Load historical 15m candles from Binance for analysis
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=60",
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status==200:
                     data=await r.json()
-                    state["candles_15m"]=[
-                        {"t":int(k[0]),"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4])}
-                        for k in data]
-                    if state["candles_15m"]:
-                        state["price"]=state["candles_15m"][-1]["c"]
-                    log.info(f"Loaded {len(state['candles_15m'])} initial 15m candles")
+                    existing_ts={c["t"] for c in state["candles_15m"]}
+                    for k in data:
+                        slot_ts=int(k[0])
+                        if slot_ts not in existing_ts:
+                            state["candles_15m"].append({"t":slot_ts,"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4])})
+                    state["candles_15m"].sort(key=lambda x:x["t"])
+                    log.info(f"Loaded {len(state['candles_15m'])} historical 15m candles")
     except Exception as e:
         log.warning(f"Initial candles: {e}")
 
@@ -329,27 +283,26 @@ async def open_bet(bot):
     if state["paused"] or state["stopped"] or state["balance"]<BET_AMOUNT or state["active_bet"]: return
     price=state["price"]
     if not price: return
-    a=analyze(state["candles_15m"], price)
+    a=analyze(state["candles_15m"],price)
     state["last_analysis"]=a
     direction=a["dir"]
-    now=utc_now()
-    so=slot15(now); sc=so+timedelta(minutes=15)
+    now=utc_now(); so=slot15(now); sc=so+timedelta(minutes=15)
     state["balance"]-=BET_AMOUNT; state["bets"]+=1
     state["active_bet"]={"dir":direction,"entry":price,"slot_open":so,"slot_close":sc,"num":state["bets"],"analysis":a}
     om=so.astimezone(MSK).strftime("%H:%M"); cm=sc.astimezone(MSK).strftime("%H:%M")
     arrow="🟢 ▲ ВВЕРХ" if direction=="UP" else "🔴 ▼ ВНИЗ"
-    # Build signal summary
     sigs="\n".join(f"  • {k}: {v}" for k,v in a["details"].items())
+    src=state["price_source"]
     await send_msg(bot,
         f"📊 *Ставка #{state['bets']}*\n\n"
         f"{arrow} · `{fmt(price)}`\n"
+        f"_{src}_\n"
         f"Слот: `{om}→{cm} МСК`\n"
-        f"Счёт сигналов: `{a['score']:+d}/10`\n"
-        f"Уверенность: `{a['confidence']}%`\n\n"
+        f"Счёт: `{a['score']:+d}/10` · Уверенность: `{a['confidence']}%`\n\n"
         f"*Индикаторы:*\n{sigs}\n\n"
         f"Баланс: `${state['balance']:.2f}`"
     )
-    log.info(f"BET #{state['bets']}: {direction} @ {fmt(price)} score={a['score']} conf={a['confidence']}%")
+    log.info(f"BET #{state['bets']}: {direction} @ {fmt(price)} score={a['score']}")
 
 async def close_bet(bot):
     bet=state["active_bet"]
@@ -362,36 +315,28 @@ async def close_bet(bot):
     state["active_bet"]=None
     if won: state["wins"]+=1
     wr=round(state["wins"]/state["bets"]*100) if state["bets"] else 0
-    result="✅ ВЫИГРЫШ" if won else "❌ ПРОИГРЫШ"
     om=bet["slot_open"].astimezone(MSK).strftime("%H:%M")
     cm=bet["slot_close"].astimezone(MSK).strftime("%H:%M")
-    state["history"].append({
-        "num":bet["num"],"dir":bet["dir"],"entry":bet["entry"],"exit":exit_p,
-        "won":won,"profit":profit,"time":om,"slot":f"{om}-{cm}",
-        "score":bet["analysis"].get("score",0),"conf":bet["analysis"].get("confidence",0)
-    })
+    state["history"].append({"num":bet["num"],"dir":bet["dir"],"entry":bet["entry"],"exit":exit_p,
+        "won":won,"profit":profit,"slot":f"{om}-{cm}","score":bet["analysis"].get("score",0),
+        "conf":bet["analysis"].get("confidence",0)})
     if len(state["history"])>100: state["history"]=state["history"][-100:]
     await send_msg(bot,
-        f"{result} · Ставка #{bet['num']}\n\n"
-        f"{'▲ ВВЕРХ' if bet['dir']=='UP' else '▼ ВНИЗ'} · `{om}–{cm} МСК`\n"
+        f"{'✅ ВЫИГРЫШ' if won else '❌ ПРОИГРЫШ'} · #{bet['num']}\n\n"
+        f"{'▲ ВВЕРХ' if bet['dir']=='UP' else '▼ ВНИЗ'} · `{om}–{cm}`\n"
         f"Вход: `{fmt(bet['entry'])}` → Выход: `{fmt(exit_p)}`\n"
         f"Прибыль: `{fmtm(profit)}`\n"
         f"Баланс: `${state['balance']:.2f}` · P&L: `{fmtm(state['pnl'])}`\n"
         f"Win rate: `{wr}%` ({state['wins']}/{state['bets']})"
     )
-    log.info(f"CLOSED #{bet['num']}: {'WIN' if won else 'LOSS'} {fmt(bet['entry'])}→{fmt(exit_p)} {fmtm(profit)} wr={wr}%")
 
-# ── TRADING LOOP ──────────────────────────────────────────────────────────────
 async def trading_loop(bot):
-    await asyncio.sleep(8)
-    log.info("Trading loop started")
+    await asyncio.sleep(10)
     while not state["stopped"]:
-        now=utc_now()
-        nxt=next_slot(now)
+        now=utc_now(); nxt=next_slot(now)
         wait=(nxt-now).total_seconds()
         log.info(f"Next slot: {nxt.astimezone(MSK).strftime('%H:%M МСК')} in {wait:.0f}s")
         await asyncio.sleep(max(0,wait-0.3))
-        # precise sync
         now=utc_now(); nxt=next_slot(now); p=(nxt-now).total_seconds()
         if p>0: await asyncio.sleep(p)
         if state["stopped"]: break
@@ -402,330 +347,445 @@ async def trading_loop(bot):
 
 async def daily_summary(bot):
     while not state["stopped"]:
-        now=msk_now()
-        t=now.replace(hour=END_HOUR,minute=0,second=5,microsecond=0)
+        now=msk_now(); t=now.replace(hour=END_HOUR,minute=0,second=5,microsecond=0)
         if now>=t: t+=timedelta(days=1)
         await asyncio.sleep((t-now).total_seconds())
         if state["stopped"]: break
         wr=round(state["wins"]/state["bets"]*100) if state["bets"] else 0
-        await send_msg(bot,
-            f"🌙 *Итог дня*\n\n"
-            f"💰 `${state['balance']:.2f}` · P&L `{fmtm(state['pnl'])}`\n"
-            f"🎯 {state['bets']} ставок · Win rate `{wr}%`\n\n"
-            f"Бот остановлен до 09:00 МСК 🤖"
-        )
+        await send_msg(bot,f"🌙 *Итог дня*\n\n💰 `${state['balance']:.2f}` · P&L `{fmtm(state['pnl'])}`\n🎯 {state['bets']} ставок · Win rate `{wr}%`")
 
-# ── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
-async def send_msg(bot, text):
-    try: await bot.send_message(chat_id=TG_CHAT_ID, text=text, parse_mode="Markdown")
+# ── TELEGRAM ─────────────────────────────────────────────────────────────────
+async def send_msg(bot,text):
+    try: await bot.send_message(chat_id=TG_CHAT_ID,text=text,parse_mode="Markdown")
     except Exception as e: log.error(f"TG: {e}")
 
-async def cmd_start(update, ctx):
-    global TG_CHAT_ID
-    TG_CHAT_ID=str(update.effective_chat.id)
-    secs=secs_to_next(); m,s=divmod(secs,60)
-    await update.message.reply_text(
-        "🤖 *PolyBot v5*\n\n"
-        f"Баланс: `${state['balance']:.2f}`\n"
-        f"Источник цены: `{state['price_source']}`\n"
-        f"До след. слота: `{m:02d}:{s:02d}`\n\n"
-        f"Веб-дашборд: `/dashboard` в браузере\n\n"
-        "Команды в меню ниже 👇",
-        parse_mode="Markdown"
-    )
+async def cmd_start(update,ctx):
+    global TG_CHAT_ID; TG_CHAT_ID=str(update.effective_chat.id)
+    await update.message.reply_text("🤖 *PolyBot v6*\n\nЦена: Chainlink на Polygon (точная цена Polymarket)\nСтратегия: 6 индикаторов\n\nКоманды в меню 👇",parse_mode="Markdown")
 
-async def cmd_status(update, ctx):
+async def cmd_status(update,ctx):
     secs=secs_to_next(); m,sc=divmod(secs,60)
     status="🛑 СТОП" if state["stopped"] else "⏸ ПАУЗА" if state["paused"] else ("✅ АКТИВЕН" if in_hours() else "🌙 ВНЕ ЧАСОВ")
     wr=round(state["wins"]/state["bets"]*100) if state["bets"] else 0
-    bet_info="нет"
-    if state["active_bet"]:
-        b=state["active_bet"]; cur=state["price"]
-        win=(b["dir"]=="UP" and cur>b["entry"]) or (b["dir"]=="DOWN" and cur<b["entry"])
-        bet_info=f"{'▲' if b['dir']=='UP' else '▼'} {fmt(b['entry'])}→{fmt(cur)} {'✅' if win else '❌'}"
+    ab=state["active_bet"]; bi="нет"
+    if ab:
+        cur=state["price"]; win=(ab["dir"]=="UP" and cur>ab["entry"]) or (ab["dir"]=="DOWN" and cur<ab["entry"])
+        bi=f"{'▲' if ab['dir']=='UP' else '▼'} {fmt(ab['entry'])}→{fmt(cur)} {'✅' if win else '❌'}"
     await update.message.reply_text(
-        f"📊 *Статус · {msk_now().strftime('%H:%M:%S МСК')}*\n\n"
+        f"📊 *{msk_now().strftime('%H:%M:%S МСК')}*\n\n"
         f"Статус: `{status}`\n"
-        f"Цена BTC: `{fmt(state['price'])}` _{state['price_source']}_\n\n"
-        f"💰 Баланс: `${state['balance']:.2f}`\n"
-        f"📈 P&L: `{fmtm(state['pnl'])}`\n"
-        f"🎯 Ставок: `{state['bets']}` · Win rate: `{wr}%`\n"
+        f"BTC: `{fmt(state['price'])}` _{state['price_source']}_\n\n"
+        f"💰 `${state['balance']:.2f}` · P&L `{fmtm(state['pnl'])}`\n"
+        f"🎯 `{state['bets']}` ставок · Win rate `{wr}%`\n"
         f"До слота: `{m:02d}:{sc:02d}`\n\n"
-        f"Ставка: `{bet_info}`",
-        parse_mode="Markdown"
-    )
+        f"Ставка: `{bi}`",parse_mode="Markdown")
 
-async def cmd_analysis(update, ctx):
-    a=analyze(state["candles_15m"], state["price"])
+async def cmd_analysis(update,ctx):
+    a=analyze(state["candles_15m"],state["price"])
     sigs="\n".join(f"• {k}: {v}" for k,v in a["details"].items())
     secs=secs_to_next(); m,s=divmod(secs,60)
     await update.message.reply_text(
-        f"🔍 *Анализ BTC · {fmt(state['price'])}*\n\n"
-        f"Прогноз: *{'▲ ВВЕРХ' if a['dir']=='UP' else '▼ ВНИЗ'}*\n"
-        f"Счёт: `{a['score']:+d}/10` · Уверенность: `{a['confidence']}%`\n\n"
-        f"*Индикаторы:*\n{sigs}\n\n"
-        f"До слота: `{m:02d}:{s:02d}`",
-        parse_mode="Markdown"
-    )
+        f"🔍 *Анализ · {fmt(state['price'])}*\n\n"
+        f"*{'▲ ВВЕРХ' if a['dir']=='UP' else '▼ ВНИЗ'}* · Счёт `{a['score']:+d}/10` · `{a['confidence']}%`\n\n"
+        f"{sigs}\n\nДо слота: `{m:02d}:{s:02d}`",parse_mode="Markdown")
 
-async def cmd_pause(update, ctx):
+async def cmd_bet(update,ctx):
+    if not in_hours(): await update.message.reply_text("⛔ 09:00–23:00 МСК"); return
+    if state["active_bet"]: await update.message.reply_text("⚠️ Уже открыта ставка"); return
+    if state["stopped"]: await update.message.reply_text("🛑 Бот остановлен"); return
+    await open_bet(ctx.bot)
+
+async def cmd_pause(update,ctx):
     state["paused"]=not state["paused"]
-    await update.message.reply_text("⏸ Пауза — новые ставки не открываются" if state["paused"] else "▶️ Возобновлён")
+    await update.message.reply_text("⏸ Пауза" if state["paused"] else "▶️ Возобновлён")
 
-async def cmd_stop(update, ctx):
+async def cmd_stop(update,ctx):
     state["stopped"]=True; state["paused"]=True
     if state["active_bet"]: await close_bet(ctx.bot)
     wr=round(state["wins"]/state["bets"]*100) if state["bets"] else 0
     await update.message.reply_text(
-        f"🛑 *Бот остановлен*\n\n"
-        f"Итог: `${state['balance']:.2f}` · P&L `{fmtm(state['pnl'])}`\n"
-        f"Win rate: `{wr}%` ({state['wins']}/{state['bets']} ставок)\n\n"
-        f"Для перезапуска — Redeploy в Railway",
-        parse_mode="Markdown"
-    )
+        f"🛑 *Остановлен*\n\n`${state['balance']:.2f}` · P&L `{fmtm(state['pnl'])}`\nWin rate `{wr}%`",
+        parse_mode="Markdown")
 
-async def cmd_reset(update, ctx):
+async def cmd_reset(update,ctx):
     state.update({"balance":100.0,"pnl":0.0,"bets":0,"wins":0,"active_bet":None,"paused":False,"stopped":False,"history":[]})
-    await update.message.reply_text("↺ Сброс · Баланс: `$100.00`", parse_mode="Markdown")
-
-async def cmd_bet(update, ctx):
-    if not in_hours(): await update.message.reply_text("⛔ Только 09:00–23:00 МСК"); return
-    if state["active_bet"]: await update.message.reply_text("⚠️ Уже открытая ставка"); return
-    if state["stopped"]: await update.message.reply_text("🛑 Бот остановлен. /reset для перезапуска"); return
-    await open_bet(ctx.bot)
+    await update.message.reply_text("↺ Сброс · `$100.00`",parse_mode="Markdown")
 
 # ── WEB DASHBOARD ─────────────────────────────────────────────────────────────
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+DASHBOARD = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PolyBot Dashboard</title>
+<title>PolyBot</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0c12;--s:#111520;--card:#161c2a;--b:#1e2840;--t:#e2e8f0;--m:#4a5a7a;--g:#00d395;--r:#f6465d;--bl:#4e7fff;--p:#7c3aed}
-body{background:var(--bg);color:var(--t);font-family:'Outfit',sans-serif;min-height:100vh;padding:16px}
-.top{display:flex;align-items:center;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--b);margin-bottom:14px}
-.logo{font-size:18px;font-weight:700;letter-spacing:-0.5px}
-.logo span{color:var(--g)}
-.tag{font-size:11px;font-family:'DM Mono',monospace;padding:3px 10px;border-radius:20px;border:1px solid}
-.tag-g{border-color:rgba(0,211,149,.3);color:var(--g);background:rgba(0,211,149,.08)}
-.tag-r{border-color:rgba(246,70,93,.3);color:var(--r);background:rgba(246,70,93,.08)}
-.tag-m{border-color:var(--b);color:var(--m)}
+:root{
+  --bg:#f7f8fa;--white:#fff;--border:#e8eaed;
+  --text:#1a1d23;--muted:#6b7280;
+  --green:#16a34a;--green-bg:#f0fdf4;--green-border:#bbf7d0;
+  --red:#dc2626;--red-bg:#fef2f2;--red-border:#fecaca;
+  --blue:#2563eb;--blue-bg:#eff6ff;
+  --orange:#f59e0b;
+  --poly-purple:#6d28d9;
+}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh}
+.topnav{background:var(--white);border-bottom:1px solid var(--border);padding:0 20px;display:flex;align-items:center;justify-content:space-between;height:52px;position:sticky;top:0;z-index:100}
+.logo{font-size:15px;font-weight:700;display:flex;align-items:center;gap:8px}
+.logo-icon{width:28px;height:28px;background:var(--poly-purple);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px}
+.nav-right{display:flex;align-items:center;gap:10px}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:500;border:1px solid}
+.pill-g{background:var(--green-bg);color:var(--green);border-color:var(--green-border)}
+.pill-r{background:var(--red-bg);color:var(--red);border-color:var(--red-border)}
+.pill-m{background:#f3f4f6;color:var(--muted);border-color:var(--border)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-g{background:var(--green);animation:pulse 1.5s infinite}
+.dot-r{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
-.grid2{display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-bottom:12px}
-.card{background:var(--card);border:1px solid var(--b);border-radius:12px;padding:14px}
-.lbl{font-size:10px;color:var(--m);text-transform:uppercase;letter-spacing:1px;font-family:'DM Mono',monospace;margin-bottom:5px}
-.val{font-size:22px;font-weight:700;line-height:1}
-.sub{font-size:11px;font-family:'DM Mono',monospace;margin-top:4px;color:var(--m)}
-.g{color:var(--g)}.r{color:var(--r)}.bl{color:var(--bl)}
-.chart-wrap{position:relative;height:180px}
-.analysis-box{background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);border-radius:10px;padding:12px;margin-top:10px}
-.arow{display:flex;justify-content:space-between;font-size:12px;font-family:'DM Mono',monospace;padding:3px 0;color:var(--m)}
-.av{color:var(--t)}
-.hist-item{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(30,40,64,.8)}
-.hist-item:last-child{border:none}
-.hi-icon{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
-.hlist{max-height:220px;overflow-y:auto}
-.hlist::-webkit-scrollbar{width:3px}
-.hlist::-webkit-scrollbar-thumb{background:var(--b);border-radius:3px}
-.active-box{background:rgba(78,127,255,.07);border:1px solid rgba(78,127,255,.25);border-radius:10px;padding:12px;margin-top:10px}
-.price-big{font-size:30px;font-weight:700;font-family:'DM Mono',monospace;letter-spacing:-1px}
-.src{font-size:11px;color:var(--m);font-family:'DM Mono',monospace;margin-top:3px}
-.score-bar{height:6px;background:var(--b);border-radius:6px;margin:8px 0;overflow:hidden;position:relative}
-.score-fill{position:absolute;top:0;height:6px;border-radius:6px;transition:width .5s,left .5s}
-@media(max-width:700px){.grid4{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
+.grid-main{display:grid;grid-template-columns:1fr 320px;gap:12px;margin-bottom:12px}
+.card{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:16px}
+.card-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;font-weight:500}
+.card-value{font-size:24px;font-weight:700;color:var(--text);line-height:1}
+.card-sub{font-size:12px;color:var(--muted);margin-top:4px;font-family:'DM Mono',monospace}
+/* Price card Polymarket style */
+.price-block{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:12px}
+.target-section{flex:1}
+.target-label{font-size:11px;color:var(--muted);font-weight:500;margin-bottom:2px}
+.target-price{font-size:20px;font-weight:700;color:var(--text);font-family:'DM Mono',monospace}
+.current-section{flex:1;text-align:right}
+.current-label{font-size:11px;font-weight:500;margin-bottom:2px}
+.current-price{font-size:20px;font-weight:700;font-family:'DM Mono',monospace}
+.timer-block{display:flex;align-items:center;gap:6px;margin-top:2px;justify-content:flex-end}
+.timer-num{background:#f3f4f6;border-radius:6px;padding:2px 8px;font-size:18px;font-weight:700;font-family:'DM Mono',monospace;min-width:36px;text-align:center}
+.timer-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;text-align:center;margin-top:1px}
+.chart-wrap{position:relative;height:160px;margin-bottom:8px}
+canvas{display:block}
+/* Polymarket-style live chart */
+#liveChart{width:100%;height:160px}
+/* Analysis panel */
+.analysis-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #f3f4f6;font-size:12px}
+.analysis-row:last-child{border:none}
+.a-key{color:var(--muted);font-weight:500}
+.a-val{font-family:'DM Mono',monospace;font-size:11px;text-align:right;max-width:55%}
+.score-wrap{margin:10px 0 6px}
+.score-track{height:6px;background:#f3f4f6;border-radius:6px;position:relative;overflow:hidden}
+.score-bar{position:absolute;top:0;height:6px;border-radius:6px;transition:all .4s}
+.score-mid{position:absolute;top:-3px;left:50%;width:2px;height:12px;background:var(--border)}
+.pred-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:8px;font-size:14px;font-weight:600;margin-bottom:10px}
+.pred-up{background:var(--green-bg);color:var(--green);border:1px solid var(--green-border)}
+.pred-dn{background:var(--red-bg);color:var(--red);border:1px solid var(--red-border)}
+/* Active bet */
+.active-bet{background:var(--blue-bg);border:1px solid #bfdbfe;border-radius:10px;padding:12px;margin-top:10px}
+.ab-row{display:flex;justify-content:space-between;font-size:12px;margin-top:4px;font-family:'DM Mono',monospace}
+.ab-key{color:var(--muted)}
+/* History */
+.hist-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)}
+.hist-row:last-child{border:none}
+.hist-icon{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0}
+.hist-main{flex:1;min-width:0}
+.hist-title{font-size:13px;font-weight:500;color:var(--text)}
+.hist-sub{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;margin-top:1px}
+.hist-profit{font-size:13px;font-weight:600;font-family:'DM Mono',monospace;white-space:nowrap}
+.hlist{max-height:240px;overflow-y:auto}
+.hlist::-webkit-scrollbar{width:4px}
+.hlist::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.wr-bar{height:4px;background:#f3f4f6;border-radius:4px;overflow:hidden;margin:8px 0 10px}
+.wr-fill{height:100%;background:var(--green);border-radius:4px;transition:width .5s}
+.src-tag{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;margin-top:3px;display:flex;align-items:center;gap:4px}
+@media(max-width:750px){.grid4{grid-template-columns:repeat(2,1fr)}.grid-main{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<div class="top">
-  <div class="logo">Poly<span>Bot</span> <span style="font-size:12px;color:var(--m);font-weight:400">v5 · BTC 15M</span></div>
-  <div style="display:flex;gap:8px;align-items:center">
-    <span id="srcTag" class="tag tag-m">—</span>
-    <span id="statusTag" class="tag tag-g">● АКТИВЕН</span>
-    <span id="clock" class="tag tag-m" style="color:var(--t)">--:--:--</span>
+<nav class="topnav">
+  <div class="logo">
+    <div class="logo-icon">₿</div>
+    PolyBot <span style="color:var(--muted);font-weight:400;margin-left:4px">BTC 15M</span>
   </div>
-</div>
+  <div class="nav-right">
+    <span id="srcPill" class="pill pill-m">—</span>
+    <span id="statusPill" class="pill pill-g"><span class="dot dot-g"></span>АКТИВЕН</span>
+    <span id="clockEl" class="pill pill-m">--:--:--</span>
+  </div>
+</nav>
+<div class="wrap">
 
 <div class="grid4">
   <div class="card">
-    <div class="lbl">Баланс</div>
-    <div class="val" id="balance">$100.00</div>
-    <div class="sub" id="balanceSub">—</div>
+    <div class="card-label">Баланс</div>
+    <div class="card-value" id="balance">$100.00</div>
+    <div class="card-sub" id="balSub">— $0.00</div>
   </div>
   <div class="card">
-    <div class="lbl">P&L итого</div>
-    <div class="val" id="pnl">$0.00</div>
-    <div class="sub" id="pnlPct">0.00%</div>
+    <div class="card-label">P&L итого</div>
+    <div class="card-value" id="pnl">$0.00</div>
+    <div class="card-sub" id="pnlPct">0.00%</div>
   </div>
   <div class="card">
-    <div class="lbl">Ставок</div>
-    <div class="val" id="bets">0</div>
-    <div class="sub" id="wr">Win rate: —</div>
+    <div class="card-label">Win rate</div>
+    <div class="card-value" id="wr">—</div>
+    <div class="card-sub" id="wrSub">0 побед / 0 ставок</div>
   </div>
   <div class="card">
-    <div class="lbl">До слота</div>
-    <div class="val g" id="countdown">--:--</div>
-    <div class="sub" id="slotInfo">—</div>
+    <div class="card-label">Серия</div>
+    <div class="card-value" id="streak">—</div>
+    <div class="card-sub" id="streakSub">нет данных</div>
   </div>
 </div>
 
-<div class="grid2">
+<div class="grid-main">
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
-      <div>
-        <div class="lbl">BTC / USD</div>
-        <div class="price-big" id="price">$—</div>
-        <div class="src" id="priceSrc">—</div>
+    <!-- Polymarket-style price header -->
+    <div class="price-block">
+      <div class="target-section">
+        <div class="target-label">Целевая цена</div>
+        <div class="target-price" id="targetPrice">$—</div>
       </div>
-      <div id="changeTag" style="font-size:13px;font-family:'DM Mono',monospace;margin-top:4px">—</div>
+      <div class="current-section">
+        <div class="current-label" id="currentLabel" style="color:var(--green)">▲ Текущая цена</div>
+        <div class="current-price" id="currentPrice" style="color:var(--orange)">$—</div>
+        <div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;margin-top:6px">
+          <div>
+            <div class="timer-num" id="timerM">--</div>
+            <div class="timer-lbl">МИН</div>
+          </div>
+          <div>
+            <div class="timer-num" id="timerS">--</div>
+            <div class="timer-lbl">СЕК</div>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
+    <div class="src-tag"><span id="priceSrc">—</span></div>
+    <div class="chart-wrap" style="margin-top:10px">
+      <canvas id="liveChart"></canvas>
+    </div>
+    <!-- OHLC bar -->
+    <div style="display:flex;gap:16px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;font-family:'DM Mono',monospace;color:var(--muted)">
+      <span>O: <b id="oO" style="color:var(--text)">—</b></span>
+      <span>H: <b id="oH" style="color:var(--green)">—</b></span>
+      <span>L: <b id="oL" style="color:var(--red)">—</b></span>
+      <span>C: <b id="oC" style="color:var(--text)">—</b></span>
+    </div>
   </div>
-  <div class="card">
-    <div class="lbl">Анализ</div>
-    <div id="pred" style="font-size:16px;font-weight:600;margin-bottom:8px">—</div>
-    <div class="score-bar" id="scoreBar">
-      <div class="score-fill" id="scoreFill"></div>
+
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <div class="card">
+      <div class="card-label" style="margin-bottom:8px">Анализ ставки</div>
+      <div id="predBadge" class="pred-badge pred-up">▲ ВВЕРХ</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Счёт: <span id="score">0</span>/10 · Уверенность: <span id="conf">0</span>%</div>
+      <div class="score-wrap">
+        <div class="score-track">
+          <div class="score-mid"></div>
+          <div class="score-bar" id="scoreBar"></div>
+        </div>
+      </div>
+      <div id="signals"></div>
+      <div id="activeBet"></div>
     </div>
-    <div class="analysis-box" id="signals"><div style="color:var(--m);font-size:12px">Загрузка...</div></div>
-    <div class="active-box" id="activeBet" style="display:none"></div>
+    <div class="card">
+      <div class="card-label" style="margin-bottom:6px">P&L кривая</div>
+      <div style="height:80px;position:relative"><canvas id="pnlChart"></canvas></div>
+    </div>
   </div>
 </div>
 
 <div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-    <div class="lbl" style="margin:0">История ставок</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <div class="card-label" style="margin:0">История ставок</div>
     <div style="display:flex;gap:6px">
-      <span id="winsTag" class="tag tag-g">0 побед</span>
-      <span id="lossTag" class="tag tag-r">0 проигр.</span>
+      <span id="winTag" class="pill pill-g">0 побед</span>
+      <span id="lossTag" class="pill pill-r">0 проигр.</span>
     </div>
   </div>
-  <div class="hlist" id="history"><div style="color:var(--m);font-size:13px;text-align:center;padding:16px">Нет ставок</div></div>
+  <div class="wr-bar"><div class="wr-fill" id="wrFill" style="width:50%"></div></div>
+  <div class="hlist" id="history"><div style="color:var(--muted);text-align:center;padding:20px;font-size:13px">Нет ставок</div></div>
 </div>
 
-<script>
-let pnlChart=null, pnlData=[0], prevPrice=0;
+</div><!-- /wrap -->
 
-function initChart(){
-  pnlChart=new Chart(document.getElementById('pnlChart'),{
+<script>
+let liveChartObj=null, pnlChartObj=null;
+let prevPrice=0, tickData=[], pnlData=[0];
+
+function initCharts(){
+  // Live price chart - Polymarket style (orange line)
+  liveChartObj=new Chart(document.getElementById('liveChart'),{
     type:'line',
-    data:{labels:['0'],datasets:[{label:'P&L',data:[0],
-      borderColor:'#00d395',borderWidth:2,fill:true,
-      backgroundColor:'rgba(0,211,149,0.06)',pointRadius:0,tension:0.3,
-      segment:{borderColor:ctx=>ctx.p0.parsed.y<0?'#f6465d':'#00d395'}}]},
-    options:{responsive:true,maintainAspectRatio:false,
+    data:{labels:[],datasets:[{
+      data:[],borderColor:'#f59e0b',borderWidth:2,fill:true,
+      backgroundColor:'rgba(245,158,11,0.08)',pointRadius:0,tension:0.1
+    }]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
+        callbacks:{label:c=>'$'+Math.round(c.raw).toLocaleString('en-US')}}},
+      scales:{
+        x:{display:false},
+        y:{position:'right',grid:{color:'rgba(0,0,0,0.04)'},
+          ticks:{color:'#9ca3af',font:{size:10,family:'DM Mono'},
+            callback:v=>'$'+Math.round(v).toLocaleString('en-US')}}
+      }
+    }
+  });
+
+  pnlChartObj=new Chart(document.getElementById('pnlChart'),{
+    type:'line',
+    data:{labels:['0'],datasets:[{data:[0],
+      borderColor:'#16a34a',borderWidth:1.5,fill:true,
+      backgroundColor:'rgba(22,163,74,0.06)',pointRadius:0,tension:0.3,
+      segment:{borderColor:ctx=>ctx.p0.parsed.y<0?'#dc2626':'#16a34a'}}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:200},
       plugins:{legend:{display:false}},
-      scales:{x:{display:false},y:{grid:{color:'rgba(255,255,255,0.04)'},
-        ticks:{color:'#4a5a7a',font:{size:10,family:'DM Mono'},callback:v=>'$'+v.toFixed(1)}}}}
+      scales:{x:{display:false},y:{display:false}}}
   });
 }
 
-async function update(){
+async function fetchAndUpdate(){
   try{
     const d=await fetch('/api/state').then(r=>r.json());
-
-    // Price
     const p=d.price||0;
-    document.getElementById('price').textContent='$'+p.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});
+
+    // ── Price display (Polymarket style) ──
+    document.getElementById('currentPrice').textContent=p?'$'+p.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'$—';
     document.getElementById('priceSrc').textContent=d.price_source||'—';
-    if(prevPrice){
-      const diff=p-prevPrice, pct=diff/prevPrice*100;
-      const pos=diff>=0;
-      document.getElementById('changeTag').textContent=(pos?'+':'')+diff.toFixed(0)+' ('+(pos?'+':'')+pct.toFixed(3)+'%)';
-      document.getElementById('changeTag').style.color=pos?'#00d395':'#f6465d';
+
+    // Target price = slot open price (active bet entry) or last known
+    const ab=d.active_bet;
+    const targetP=ab?ab.entry:p;
+    document.getElementById('targetPrice').textContent=targetP?'$'+targetP.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'$—';
+
+    // Direction indicator
+    const diff=p-targetP;
+    const up=diff>=0;
+    document.getElementById('currentLabel').textContent=(up?'▲ ':'▼ ')+'Текущая цена +$'+Math.abs(diff).toFixed(0);
+    document.getElementById('currentLabel').style.color=up?'#16a34a':'#dc2626';
+    document.getElementById('currentPrice').style.color='#f59e0b';
+
+    // Live ticks chart
+    const ticks=d.ticks||[];
+    if(ticks.length>1){
+      const labels=ticks.map(t=>new Date(t.ts).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+      const prices=ticks.map(t=>t.p);
+      liveChartObj.data.labels=labels;
+      liveChartObj.data.datasets[0].data=prices;
+      // Color based on direction vs target
+      const isUp=prices[prices.length-1]>=prices[0];
+      liveChartObj.data.datasets[0].borderColor=isUp?'#f59e0b':'#f59e0b';
+      // Add target line annotation-style as horizontal reference
+      liveChartObj.update('none');
     }
-    if(p) prevPrice=p;
 
-    // Metrics
-    const bal=d.balance; const pnl=d.pnl;
+    // OHLC of last 15m candle
+    const c15=d.candles_15m||[];
+    if(c15.length){
+      const last=c15[c15.length-1];
+      document.getElementById('oO').textContent='$'+Math.round(last.o).toLocaleString('en-US');
+      document.getElementById('oH').textContent='$'+Math.round(last.h).toLocaleString('en-US');
+      document.getElementById('oL').textContent='$'+Math.round(last.l).toLocaleString('en-US');
+      document.getElementById('oC').textContent='$'+Math.round(last.c).toLocaleString('en-US');
+    }
+
+    // ── Metrics ──
+    const bal=d.balance, pnl=d.pnl;
     document.getElementById('balance').textContent='$'+bal.toFixed(2);
-    document.getElementById('balanceSub').textContent=(pnl>=0?'+ ':'- ')+'$'+Math.abs(pnl).toFixed(2);
-    document.getElementById('balanceSub').style.color=pnl>=0?'#00d395':'#f6465d';
+    document.getElementById('balance').style.color=bal>=100?'#1a1d23':'#dc2626';
+    document.getElementById('balSub').textContent=(pnl>=0?'+ ':'- ')+'$'+Math.abs(pnl).toFixed(2);
+    document.getElementById('balSub').style.color=pnl>=0?'#16a34a':'#dc2626';
     document.getElementById('pnl').textContent=(pnl>=0?'+':'')+'$'+pnl.toFixed(2);
-    document.getElementById('pnl').style.color=pnl>=0?'#00d395':'#f6465d';
+    document.getElementById('pnl').style.color=pnl>=0?'#16a34a':'#dc2626';
     document.getElementById('pnlPct').textContent=(pnl/100*100).toFixed(2)+'%';
-    document.getElementById('bets').textContent=d.bets;
+
     const wr=d.bets?Math.round(d.wins/d.bets*100):0;
-    document.getElementById('wr').textContent='Win rate: '+wr+'% ('+d.wins+'/'+d.bets+')';
-    document.getElementById('wr').style.color=wr>=60?'#00d395':wr>=40?'#f59e0b':'#f6465d';
+    document.getElementById('wr').textContent=wr+'%';
+    document.getElementById('wr').style.color=wr>=60?'#16a34a':wr>=40?'#f59e0b':'#dc2626';
+    document.getElementById('wrSub').textContent=d.wins+' побед / '+d.bets+' ставок';
 
-    // Status
-    const stopped=d.stopped, paused=d.paused;
-    const inH=d.in_hours;
-    const sTag=document.getElementById('statusTag');
-    if(stopped){sTag.textContent='🛑 СТОП';sTag.className='tag tag-r';}
-    else if(paused){sTag.textContent='⏸ ПАУЗА';sTag.className='tag tag-m';}
-    else if(inH){sTag.textContent='● АКТИВЕН';sTag.className='tag tag-g';}
-    else{sTag.textContent='🌙 ВНЕ ЧАСОВ';sTag.className='tag tag-m';}
-    document.getElementById('srcTag').textContent=d.price_source||'—';
+    // Streak
+    const hist=d.history||[];
+    if(hist.length){
+      let streak=1;
+      for(let i=hist.length-2;i>=0;i--){if(hist[i].won===hist[hist.length-1].won)streak++;else break;}
+      const lastWon=hist[hist.length-1].won;
+      document.getElementById('streak').textContent=(lastWon?'✅':'❌')+' '+streak;
+      document.getElementById('streak').style.color=lastWon?'#16a34a':'#dc2626';
+      document.getElementById('streakSub').textContent=lastWon?streak+' побед подряд':streak+' проигрышей подряд';
+    }
 
-    // Countdown
-    document.getElementById('slotInfo').textContent=d.next_slot_msk||'—';
+    // ── Status ──
+    const sp=document.getElementById('statusPill');
+    if(d.stopped){sp.className='pill pill-r';sp.innerHTML='<span class="dot dot-r"></span>СТОП';}
+    else if(d.paused){sp.className='pill pill-m';sp.innerHTML='⏸ ПАУЗА';}
+    else if(d.in_hours){sp.className='pill pill-g';sp.innerHTML='<span class="dot dot-g"></span>АКТИВЕН';}
+    else{sp.className='pill pill-m';sp.innerHTML='🌙 ВНЕ ЧАСОВ';}
+    document.getElementById('srcPill').textContent=d.price_source||'—';
 
-    // Analysis
+    // ── Analysis ──
     const a=d.last_analysis||{};
     if(a.dir){
-      const up=a.dir==='UP';
-      document.getElementById('pred').textContent=(up?'▲ ВВЕРХ':'▼ ВНИЗ')+' · '+a.confidence+'%';
-      document.getElementById('pred').style.color=up?'#00d395':'#f6465d';
-      const score=a.score||0; const max=10;
-      const pct=((score+max)/(max*2))*100;
-      document.getElementById('scoreFill').style.width=Math.abs(score)/max*50+'%';
-      document.getElementById('scoreFill').style.left=score>=0?'50%':(50+score/max*50)+'%';
-      document.getElementById('scoreFill').style.background=score>=0?'#00d395':'#f6465d';
+      const aUp=a.dir==='UP';
+      const pb=document.getElementById('predBadge');
+      pb.textContent=(aUp?'▲ ВВЕРХ':'▼ ВНИЗ');
+      pb.className='pred-badge '+(aUp?'pred-up':'pred-dn');
+      document.getElementById('score').textContent=(a.score>=0?'+':'')+a.score;
+      document.getElementById('conf').textContent=a.confidence||0;
+      // Score bar
+      const sc=a.score||0; const pct=Math.abs(sc)/10*50;
+      const sb=document.getElementById('scoreBar');
+      sb.style.width=pct+'%';
+      sb.style.left=sc>=0?'50%':(50-pct)+'%';
+      sb.style.background=sc>=0?'#16a34a':'#dc2626';
+      // Signals
       const det=a.details||{};
-      document.getElementById('signals').innerHTML=Object.entries(det).map(([k,v])=>
-        `<div class="arow"><span>${k}</span><span class="av" style="font-size:11px;text-align:right;max-width:60%">${v}</span></div>`
-      ).join('');
-    }
-
-    // Active bet
-    const ab=d.active_bet;
-    const abEl=document.getElementById('activeBet');
-    if(ab){
-      abEl.style.display='block';
-      const cur=p; const up2=ab.dir==='UP';
-      const win=(up2&&cur>ab.entry)||(!up2&&cur<ab.entry);
-      const diff=cur-ab.entry;
-      abEl.innerHTML=`<div style="font-size:11px;color:#a0aec0;font-family:'DM Mono',monospace;margin-bottom:6px">ОТКРЫТАЯ СТАВКА #${ab.num}</div>
-        <div style="display:flex;justify-content:space-between;font-size:13px">
-          <span style="color:${up2?'#00d395':'#f6465d'};font-weight:600">${up2?'▲ ВВЕРХ':'▼ ВНИЗ'}</span>
-          <span style="color:${win?'#00d395':'#f6465d'}">${win?'✅ Выигрываем':'❌ Проигрываем'}</span>
-        </div>
-        <div style="font-size:12px;font-family:'DM Mono',monospace;color:#4a5a7a;margin-top:6px">
-          Вход: <span style="color:#e2e8f0">$${Math.round(ab.entry).toLocaleString()}</span> → 
-          Сейчас: <span style="color:${win?'#00d395':'#f6465d'}">$${Math.round(cur).toLocaleString()}</span>
-          (${diff>=0?'+':''}${diff.toFixed(0)})
-        </div>`;
-    } else { abEl.style.display='none'; }
-
-    // History
-    const hist=d.history||[];
-    const wins2=hist.filter(h=>h.won).length;
-    document.getElementById('winsTag').textContent=wins2+' побед';
-    document.getElementById('lossTag').textContent=(hist.length-wins2)+' проигр.';
-    if(hist.length){
-      document.getElementById('history').innerHTML=[...hist].reverse().slice(0,20).map(h=>`
-        <div class="hist-item">
-          <div style="display:flex;align-items:center;gap:8px">
-            <div class="hi-icon" style="background:${h.won?'rgba(0,211,149,.12)':'rgba(246,70,93,.12)'};color:${h.won?'#00d395':'#f6465d'}">${h.dir==='UP'?'↑':'↓'}</div>
-            <div>
-              <div style="font-size:12px;color:#e2e8f0">#${h.num} ${h.dir==='UP'?'ВВЕРХ':'ВНИЗ'} · ${h.slot}</div>
-              <div style="font-size:10px;color:#4a5a7a;font-family:'DM Mono',monospace">$${Math.round(h.entry).toLocaleString()}→$${Math.round(h.exit).toLocaleString()} · conf:${h.conf}% score:${h.score>=0?'+':''}${h.score}</div>
-            </div>
-          </div>
-          <span style="font-size:12px;font-family:'DM Mono',monospace;color:${h.won?'#00d395':'#f6465d'}">${h.won?'+':''}$${h.profit.toFixed(2)}</span>
+      document.getElementById('signals').innerHTML=Object.entries(det).map(([k,v])=>`
+        <div class="analysis-row">
+          <span class="a-key">${k}</span>
+          <span class="a-val" style="color:${v.includes('▲')||v.includes('↗')?'#16a34a':v.includes('▼')||v.includes('↘')?'#dc2626':'#6b7280'}">${v}</span>
         </div>`).join('');
     }
 
-    // PnL chart
-    if(pnlChart){
-      pnlData=[0,...(hist.length?hist.map((_,i)=>hist.slice(0,i+1).reduce((a,h)=>a+h.profit,0)):[])];
-      pnlChart.data.labels=pnlData.map((_,i)=>i);
-      pnlChart.data.datasets[0].data=pnlData;
-      pnlChart.update('none');
+    // ── Active bet ──
+    const abEl=document.getElementById('activeBet');
+    if(ab){
+      const cur=p; const abUp=ab.dir==='UP';
+      const abWin=(abUp&&cur>ab.entry)||(!abUp&&cur<ab.entry);
+      const abDiff=cur-ab.entry;
+      abEl.innerHTML=`<div class="active-bet">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <span style="font-size:11px;color:#3b82f6;font-weight:600;text-transform:uppercase;letter-spacing:.5px">Открытая ставка #${ab.num}</span>
+          <span style="font-size:12px;font-weight:600;color:${abWin?'#16a34a':'#dc2626'}">${abWin?'✅ Выигрываем':'❌ Проигрываем'}</span>
+        </div>
+        <div class="ab-row"><span class="ab-key">Направление</span><span style="color:${abUp?'#16a34a':'#dc2626'};font-weight:600">${abUp?'▲ ВВЕРХ':'▼ ВНИЗ'}</span></div>
+        <div class="ab-row"><span class="ab-key">Вход</span><span>$${Math.round(ab.entry).toLocaleString()}</span></div>
+        <div class="ab-row"><span class="ab-key">Сейчас</span><span style="color:${abDiff>=0?'#16a34a':'#dc2626'}">$${Math.round(cur).toLocaleString()} (${abDiff>=0?'+':''}${abDiff.toFixed(0)})</span></div>
+      </div>`;
+    } else { abEl.innerHTML=''; }
+
+    // ── P&L chart ──
+    if(pnlChartObj&&hist.length){
+      const pnls=[0,...hist.map((_,i)=>hist.slice(0,i+1).reduce((a,h)=>a+h.profit,0))];
+      pnlChartObj.data.labels=pnls.map((_,i)=>i);
+      pnlChartObj.data.datasets[0].data=pnls;
+      pnlChartObj.update('none');
+    }
+
+    // ── History ──
+    const wins2=hist.filter(h=>h.won).length; const losses2=hist.length-wins2;
+    document.getElementById('winTag').textContent=wins2+' побед';
+    document.getElementById('lossTag').textContent=losses2+' проигр.';
+    const wrPct=hist.length?wins2/hist.length*100:50;
+    document.getElementById('wrFill').style.width=wrPct+'%';
+    if(hist.length){
+      document.getElementById('history').innerHTML=[...hist].reverse().slice(0,25).map(h=>`
+        <div class="hist-row">
+          <div class="hist-icon" style="background:${h.won?'#f0fdf4':'#fef2f2'};color:${h.won?'#16a34a':'#dc2626'}">${h.dir==='UP'?'↑':'↓'}</div>
+          <div class="hist-main">
+            <div class="hist-title">#${h.num} ${h.dir==='UP'?'ВВЕРХ':'ВНИЗ'} · ${h.slot}</div>
+            <div class="hist-sub">$${Math.round(h.entry).toLocaleString()}→$${Math.round(h.exit).toLocaleString()} · conf:${h.conf}% score:${h.score>=0?'+':''}${h.score}</div>
+          </div>
+          <div class="hist-profit" style="color:${h.won?'#16a34a':'#dc2626'}">${h.won?'+':''}$${h.profit.toFixed(2)}</div>
+        </div>`).join('');
     }
   }catch(e){console.error(e)}
 }
@@ -734,93 +794,69 @@ async function update(){
 function tick(){
   const now=new Date();
   const msk=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Moscow'}));
-  document.getElementById('clock').textContent=msk.toLocaleTimeString('ru-RU')+' МСК';
+  document.getElementById('clockEl').textContent=msk.toLocaleTimeString('ru-RU')+' МСК';
   const sec=Math.floor(now/1000); const slot=Math.ceil(sec/900)*900;
-  const left=slot-sec; const m=Math.floor(left/60); const s=left%60;
-  document.getElementById('countdown').textContent=`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  const left=slot-sec;
+  document.getElementById('timerM').textContent=String(Math.floor(left/60)).padStart(2,'0');
+  document.getElementById('timerS').textContent=String(left%60).padStart(2,'0');
 }
 
-initChart();
-update();
-setInterval(update,3000);
+initCharts();
+fetchAndUpdate();
+setInterval(fetchAndUpdate,1000);
 setInterval(tick,1000);
 tick();
 </script>
 </body></html>"""
 
-# ── FLASK APP ─────────────────────────────────────────────────────────────────
-flask_app = Flask(__name__)
+flask_app=Flask(__name__)
 
 @flask_app.route("/")
-def dashboard(): return render_template_string(DASHBOARD_HTML)
+def dashboard(): return DASHBOARD
 
 @flask_app.route("/api/state")
 def api_state():
     now=utc_now(); nxt=next_slot(now)
-    secs=max(0,int((nxt-now).total_seconds()))
-    m,s=divmod(secs,60)
     ab=state["active_bet"]
+    a=analyze(state["candles_15m"],state["price"])
+    state["last_analysis"]=a
     return jsonify({
-        "balance":state["balance"], "pnl":state["pnl"],
-        "bets":state["bets"], "wins":state["wins"],
-        "price":state["price"], "price_source":state["price_source"],
-        "paused":state["paused"], "stopped":state["stopped"],
-        "in_hours":in_hours(),
-        "ws_ok":state["ws_ok"],
-        "next_slot_msk": nxt.astimezone(MSK).strftime("%H:%M МСК"),
-        "active_bet": {
-            "num":ab["num"],"dir":ab["dir"],"entry":ab["entry"],
-            "slot":ab["slot_open"].astimezone(MSK).strftime("%H:%M")
-        } if ab else None,
-        "last_analysis": state["last_analysis"],
-        "history": state["history"][-50:],
+        "balance":state["balance"],"pnl":state["pnl"],
+        "bets":state["bets"],"wins":state["wins"],
+        "price":state["price"],"price_source":state["price_source"],
+        "paused":state["paused"],"stopped":state["stopped"],"in_hours":in_hours(),
+        "ticks":state["ticks"][-120:],
+        "candles_15m":state["candles_15m"][-5:],
+        "active_bet":{"num":ab["num"],"dir":ab["dir"],"entry":ab["entry"]} if ab else None,
+        "last_analysis":a,
+        "history":state["history"],
     })
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    flask_app.run(host="0.0.0.0",port=PORT,debug=False,use_reloader=False)
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"PolyBot v5 starting... token={'SET' if TG_TOKEN else 'MISSING'} chat={TG_CHAT_ID}")
-
-    # Flask в отдельном потоке
-    Thread(target=run_flask, daemon=True).start()
-    log.info(f"Web dashboard: http://0.0.0.0:{PORT}")
-
+    log.info(f"PolyBot v6 | token={'SET' if TG_TOKEN else 'MISSING'} | port={PORT}")
+    Thread(target=run_flask,daemon=True).start()
     app=(Application.builder().token(TG_TOKEN).concurrent_updates(False).build())
     for cmd,fn in [("start",cmd_start),("status",cmd_status),("analysis",cmd_analysis),
                    ("bet",cmd_bet),("pause",cmd_pause),("stop",cmd_stop),("reset",cmd_reset)]:
         app.add_handler(CommandHandler(cmd,fn))
-
     async with app:
         await app.start()
         bot=app.bot
-
-        # Настроить меню в Telegram
         await bot.set_my_commands([
-            BotCommand("status",   "📊 Статус бота"),
-            BotCommand("analysis", "🔍 Анализ рынка"),
-            BotCommand("bet",      "▶️ Ставить сейчас"),
-            BotCommand("pause",    "⏸ Пауза / Возобновить"),
-            BotCommand("stop",     "🛑 Остановить бота"),
-            BotCommand("reset",    "↺ Сброс баланса"),
+            BotCommand("status","📊 Статус"),BotCommand("analysis","🔍 Анализ"),
+            BotCommand("bet","▶️ Ставить сейчас"),BotCommand("pause","⏸ Пауза"),
+            BotCommand("stop","🛑 Стоп"),BotCommand("reset","↺ Сброс"),
         ])
-
-        await load_initial_candles()
-        await send_msg(bot,
-            f"🚀 *PolyBot v5 запущен!*\n\n"
-            f"Баланс: `$100.00` · Ставки: `$5.00` каждые 15 мин\n"
-            f"Расписание: 09:00–23:00 МСК\n"
-            f"Стратегия: 6 индикаторов · взвешенное голосование\n\n"
-            f"🌐 Веб-дашборд доступен в Railway → ваш домен\n\n"
-            f"Команды в меню 👇"
-        )
-        log.info("Bot started, polling...")
+        await load_initial()
+        await send_msg(bot,"🚀 *PolyBot v6*\n\nЦена: Chainlink на Polygon (точная цена Polymarket)\nСтратегия: 6 индикаторов · взвешенное голосование\n\nKоманды в меню 👇")
         await asyncio.gather(
-            app.updater.start_polling(drop_pending_updates=True,
-                allowed_updates=["message"],read_timeout=10,write_timeout=10,
-                connect_timeout=10,pool_timeout=10),
-            price_loop(),
+            app.updater.start_polling(drop_pending_updates=True,allowed_updates=["message"],
+                read_timeout=10,write_timeout=10,connect_timeout=10,pool_timeout=10),
+            chainlink_price_loop(),
+            fallback_price_loop(),
             trading_loop(bot),
             daily_summary(bot),
         )
