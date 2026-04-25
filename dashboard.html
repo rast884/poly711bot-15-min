@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PolyBot · BTC 15M</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Unbounded:wght@400;600;700;900&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0e14;
+  --panel:#111620;
+  --border:#1c2333;
+  --border2:#242f45;
+  --text:#e8edf5;
+  --muted:#5a6a85;
+  --green:#00e676;
+  --green2:#00c853;
+  --red:#ff3d5a;
+  --orange:#ffab00;
+  --blue:#2979ff;
+  --purple:#7c4dff;
+  --glow-g:rgba(0,230,118,0.15);
+  --glow-r:rgba(255,61,90,0.15);
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Space Mono',monospace;overflow-x:hidden}
+
+/* Grid noise bg */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:linear-gradient(rgba(255,255,255,0.015) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.015) 1px,transparent 1px);
+  background-size:40px 40px;pointer-events:none;z-index:0
+}
+
+.wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:12px 16px}
+
+/* ── TOP BAR ── */
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 16px;margin-bottom:12px;
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;
+}
+.logo{
+  font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;
+  letter-spacing:1px;color:#fff;display:flex;align-items:center;gap:10px
+}
+.logo-b{
+  width:30px;height:30px;border-radius:8px;
+  background:linear-gradient(135deg,var(--orange),#ff6d00);
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:900;color:#000;font-family:'Unbounded',sans-serif
+}
+.top-right{display:flex;align-items:center;gap:8px}
+.badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 10px;border-radius:6px;font-size:10px;font-weight:700;
+  letter-spacing:.5px;text-transform:uppercase;border:1px solid;
+}
+.badge-g{background:rgba(0,230,118,.08);color:var(--green);border-color:rgba(0,230,118,.25)}
+.badge-r{background:rgba(255,61,90,.08);color:var(--red);border-color:rgba(255,61,90,.25)}
+.badge-m{background:rgba(90,106,133,.1);color:var(--muted);border-color:var(--border2)}
+.pulse{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.4s ease infinite}
+.pulse-r{background:var(--red);animation:none}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,230,118,.4)}70%{opacity:.7;box-shadow:0 0 0 6px transparent}}
+#clock{font-size:11px;color:var(--text);font-family:'Space Mono',monospace}
+
+/* ── MAIN PRICE CARD ── */
+.price-card{
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  padding:16px;margin-bottom:12px;position:relative;overflow:hidden
+}
+.price-card::after{
+  content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--orange),transparent)
+}
+.price-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.price-left .label{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.target-val{font-family:'Unbounded',sans-serif;font-size:13px;color:var(--muted);font-weight:400}
+.current-val{
+  font-family:'Unbounded',sans-serif;font-size:32px;font-weight:900;
+  color:var(--orange);letter-spacing:-1px;line-height:1;
+  text-shadow:0 0 30px rgba(255,171,0,.3)
+}
+.price-change{font-size:12px;margin-top:4px;display:flex;align-items:center;gap:6px}
+.price-right{text-align:right}
+.timer-box{
+  background:rgba(255,171,0,.06);border:1px solid rgba(255,171,0,.2);
+  border-radius:10px;padding:10px 16px;text-align:center;min-width:100px
+}
+.timer-nums{display:flex;align-items:center;gap:4px;justify-content:center}
+.t-block{
+  background:#0b0e14;border:1px solid var(--border2);border-radius:6px;
+  padding:4px 8px;font-family:'Unbounded',sans-serif;font-size:20px;font-weight:700;
+  color:var(--orange);min-width:36px;text-align:center;line-height:1
+}
+.t-sep{font-size:18px;color:var(--orange);font-weight:700;margin:0 1px}
+.timer-lbl{font-size:9px;color:var(--muted);letter-spacing:1px;margin-top:4px;text-transform:uppercase}
+.chart-wrap{position:relative;height:140px;margin-top:8px}
+#liveChart{width:100%;height:140px}
+
+/* ── 3 COL STATS ── */
+.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.stat-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat-card.g::before{background:linear-gradient(90deg,var(--green2),var(--green))}
+.stat-card.r::before{background:linear-gradient(90deg,#c62828,var(--red))}
+.stat-card.b::before{background:linear-gradient(90deg,#1565c0,var(--blue))}
+.stat-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.stat-val{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:700;line-height:1}
+.stat-sub{font-size:10px;color:var(--muted);margin-top:5px}
+
+/* ── 2 COL BOTTOM ── */
+.bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.panel-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px}
+.panel-title{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+
+/* Active bet */
+.bet-direction{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;margin-bottom:10px
+}
+.bet-dir-up{background:var(--glow-g);border:1px solid rgba(0,230,118,.2)}
+.bet-dir-dn{background:var(--glow-r);border:1px solid rgba(255,61,90,.2)}
+.bet-arrow{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:900}
+.bet-dir-label{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700}
+.bet-rows{display:flex;flex-direction:column;gap:4px}
+.bet-row{display:flex;justify-content:space-between;font-size:11px}
+.bet-key{color:var(--muted)}
+.bet-val{font-weight:700}
+.result-badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;margin-top:8px;width:100%;justify-content:center
+}
+.result-win{background:var(--glow-g);color:var(--green);border:1px solid rgba(0,230,118,.3)}
+.result-loss{background:var(--glow-r);color:var(--red);border:1px solid rgba(255,61,90,.3)}
+
+/* Forecast */
+.forecast-big{
+  text-align:center;padding:16px;border-radius:10px;margin-bottom:12px
+}
+.forecast-big.up{background:var(--glow-g);border:1px solid rgba(0,230,118,.2)}
+.forecast-big.dn{background:var(--glow-r);border:1px solid rgba(255,61,90,.2)}
+.forecast-arrow{font-size:36px;display:block;margin-bottom:4px}
+.forecast-text{font-family:'Unbounded',sans-serif;font-size:15px;font-weight:700}
+.forecast-conf{font-size:10px;color:var(--muted);margin-top:4px}
+.conf-bar{height:4px;background:var(--border2);border-radius:4px;margin:8px 0;overflow:hidden}
+.conf-fill{height:100%;border-radius:4px;transition:width .5s}
+.conf-fill.up{background:linear-gradient(90deg,var(--green2),var(--green))}
+.conf-fill.dn{background:linear-gradient(90deg,#c62828,var(--red))}
+.signal-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:10px}
+.signal-row:last-child{border:none}
+.sig-key{color:var(--muted)}
+.sig-val{text-align:right;max-width:60%;font-size:10px}
+
+/* Buttons */
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.btn{
+  padding:10px;border:none;border-radius:8px;font-family:'Unbounded',sans-serif;
+  font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.5px;
+  transition:all .15s;text-transform:uppercase
+}
+.btn-start{background:var(--green);color:#000}
+.btn-start:hover{background:var(--green2);box-shadow:0 0 16px rgba(0,230,118,.4)}
+.btn-stop{background:transparent;color:var(--red);border:1px solid rgba(255,61,90,.4)}
+.btn-stop:hover{background:var(--glow-r);box-shadow:0 0 16px rgba(255,61,90,.2)}
+.btn:disabled{opacity:.35;cursor:not-allowed;box-shadow:none!important}
+
+/* No bet placeholder */
+.no-bet{text-align:center;padding:24px;color:var(--muted);font-size:11px}
+.no-bet-icon{font-size:28px;margin-bottom:8px;opacity:.4}
+
+@media(max-width:640px){
+  .stats-row{grid-template-columns:1fr 1fr}
+  .bottom-grid{grid-template-columns:1fr}
+  .current-val{font-size:26px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-b">₿</div>
+    POLYBOT <span style="color:var(--muted);font-weight:400;font-size:11px">/ 15M</span>
+  </div>
+  <div class="top-right">
+    <span id="srcBadge" class="badge badge-m">—</span>
+    <span id="statusBadge" class="badge badge-g"><span class="pulse" id="pulseDot"></span>АКТИВЕН</span>
+    <span id="clock">--:--:--</span>
+  </div>
+</div>
+
+<!-- PRICE CARD -->
+<div class="price-card">
+  <div class="price-top">
+    <div class="price-left">
+      <div class="label">BTC / USD · Binance 15M kline</div>
+      <div class="target-val">Целевая: <span id="targetPrice">$—</span></div>
+      <div class="current-val" id="currentPrice">$—</div>
+      <div class="price-change" id="priceChange">
+        <span id="changeArrow">—</span>
+        <span id="changeDiff" style="color:var(--muted)">—</span>
+      </div>
+    </div>
+    <div class="price-right">
+      <div class="timer-box">
+        <div class="timer-nums">
+          <div>
+            <div class="t-block" id="tmM">--</div>
+          </div>
+          <div class="t-sep">:</div>
+          <div>
+            <div class="t-block" id="tmS">--</div>
+          </div>
+        </div>
+        <div class="timer-lbl">до закрытия слота</div>
+      </div>
+    </div>
+  </div>
+  <div class="chart-wrap">
+    <canvas id="liveChart"></canvas>
+  </div>
+</div>
+
+<!-- STATS ROW -->
+<div class="stats-row">
+  <div class="stat-card g">
+    <div class="stat-lbl">Баланс</div>
+    <div class="stat-val" id="balance">$100.00</div>
+    <div class="stat-sub" id="balSub">P&L: $0.00</div>
+  </div>
+  <div class="stat-card b">
+    <div class="stat-lbl">Ставок / Win rate</div>
+    <div class="stat-val" id="bets">0 / —</div>
+    <div class="stat-sub" id="wrSub">0 побед · 0 проигр.</div>
+  </div>
+  <div class="stat-card r">
+    <div class="stat-lbl">Текущая серия</div>
+    <div class="stat-val" id="streak">—</div>
+    <div class="stat-sub" id="streakSub">нет данных</div>
+  </div>
+</div>
+
+<!-- BOTTOM 2 COL -->
+<div class="bottom-grid">
+
+  <!-- Active Bet -->
+  <div class="panel-card">
+    <div class="panel-title">Активная ставка</div>
+    <div id="activeBetContent">
+      <div class="no-bet"><div class="no-bet-icon">◈</div>Нет открытой ставки</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-start" id="btnStart" onclick="sendCmd('start')">▶ Старт</button>
+      <button class="btn btn-stop" id="btnStop" onclick="sendCmd('stop')">■ Стоп</button>
+    </div>
+  </div>
+
+  <!-- Forecast -->
+  <div class="panel-card">
+    <div class="panel-title">Прогноз</div>
+    <div class="forecast-big up" id="forecastBox">
+      <span class="forecast-arrow" id="forecastArrow">↑</span>
+      <div class="forecast-text" id="forecastText">ВВЕРХ</div>
+      <div class="forecast-conf" id="forecastConf">Уверенность: —%</div>
+    </div>
+    <div class="conf-bar"><div class="conf-fill up" id="confFill" style="width:50%"></div></div>
+    <div id="signals"></div>
+  </div>
+
+</div>
+</div><!-- /wrap -->
+
+<script>
+let chartObj = null;
+let tickBuffer = []; // {ts, price}
+let prevPrice = 0;
+
+// ── INIT CHART ──────────────────────────────────────────────────────────────
+function initChart() {
+  const ctx = document.getElementById('liveChart').getContext('2d');
+  chartObj = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        borderColor: '#ffab00',
+        borderWidth: 1.5,
+        fill: true,
+        backgroundColor: (ctx) => {
+          const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 140);
+          g.addColorStop(0, 'rgba(255,171,0,0.12)');
+          g.addColorStop(1, 'rgba(255,171,0,0)');
+          return g;
+        },
+        pointRadius: 0,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      animation: { duration: 0 },
+      plugins: { legend: { display: false },
+        tooltip: { mode: 'index', intersect: false,
+          callbacks: { label: c => '$' + c.raw.toLocaleString('en-US', {minimumFractionDigits: 2}) }
+        }
+      },
+      scales: {
+        x: { display: false },
+        y: {
+          position: 'right',
+          grid: { color: 'rgba(255,255,255,0.04)' },
+          ticks: {
+            color: '#5a6a85', font: { size: 9, family: 'Space Mono' },
+            callback: v => '$' + Math.round(v).toLocaleString('en-US')
+          }
+        }
+      }
+    }
+  });
+}
+
+// ── FETCH STATE & UPDATE ──────────────────────────────────────────────────────
+async function update() {
+  try {
+    const d = await fetch('/api/state').then(r => r.json());
+    const p = d.price || 0;
+
+    // Price
+    if (p > 0) {
+      const ts = Date.now();
+      tickBuffer.push({ ts, price: p });
+      // keep 20 min
+      tickBuffer = tickBuffer.filter(t => ts - t.ts < 20 * 60 * 1000);
+
+      document.getElementById('currentPrice').textContent =
+        '$' + p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+      // Change vs target
+      const target = d.active_bet ? d.active_bet.entry : (d.slot_open_price || p);
+      document.getElementById('targetPrice').textContent =
+        '$' + target.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+      const diff = p - target;
+      const up = diff >= 0;
+      document.getElementById('changeArrow').textContent = up ? '▲' : '▼';
+      document.getElementById('changeArrow').style.color = up ? '#00e676' : '#ff3d5a';
+      document.getElementById('changeDiff').textContent =
+        (up ? '+' : '') + '$' + diff.toFixed(2) + '  (' + (up ? '+' : '') + (diff / target * 100).toFixed(4) + '%)';
+      document.getElementById('changeDiff').style.color = up ? '#00e676' : '#ff3d5a';
+
+      // Update chart
+      if (chartObj && tickBuffer.length > 1) {
+        chartObj.data.labels = tickBuffer.map(t =>
+          new Date(t.ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        );
+        chartObj.data.datasets[0].data = tickBuffer.map(t => t.price);
+        chartObj.update('none');
+      }
+      prevPrice = p;
+    }
+
+    // Source badge
+    document.getElementById('srcBadge').textContent = d.price_source || '—';
+
+    // Status badge
+    const sb = document.getElementById('statusBadge');
+    const pd = document.getElementById('pulseDot');
+    if (d.stopped) {
+      sb.className = 'badge badge-r'; sb.innerHTML = '■ СТОП'; pd && pd.remove();
+    } else if (d.paused) {
+      sb.className = 'badge badge-m'; sb.textContent = '⏸ ПАУЗА';
+    } else if (d.in_hours) {
+      sb.className = 'badge badge-g'; sb.innerHTML = '<span class="pulse" id="pulseDot"></span>АКТИВЕН';
+    } else {
+      sb.className = 'badge badge-m'; sb.textContent = '🌙 ВНЕ ЧАСОВ';
+    }
+
+    // Buttons
+    document.getElementById('btnStart').disabled = !d.stopped && !d.paused;
+    document.getElementById('btnStop').disabled = d.stopped;
+
+    // Stats
+    const bal = d.balance, pnl = d.pnl;
+    const balEl = document.getElementById('balance');
+    balEl.textContent = '$' + bal.toFixed(2);
+    balEl.style.color = bal >= 100 ? '#00e676' : bal >= 50 ? '#ffab00' : '#ff3d5a';
+    document.getElementById('balSub').textContent =
+      'P&L: ' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    document.getElementById('balSub').style.color = pnl >= 0 ? '#00e676' : '#ff3d5a';
+
+    const wr = d.bets ? Math.round(d.wins / d.bets * 100) : 0;
+    document.getElementById('bets').textContent = d.bets + ' / ' + wr + '%';
+    document.getElementById('bets').style.color = wr >= 60 ? '#00e676' : wr >= 40 ? '#ffab00' : '#ff3d5a';
+    document.getElementById('wrSub').textContent = d.wins + ' побед · ' + (d.bets - d.wins) + ' проигр.';
+
+    // Streak
+    const hist = d.history || [];
+    if (hist.length) {
+      let s = 1;
+      for (let i = hist.length - 2; i >= 0; i--) {
+        if (hist[i].won === hist[hist.length - 1].won) s++;
+        else break;
+      }
+      const lastWon = hist[hist.length - 1].won;
+      const streakEl = document.getElementById('streak');
+      streakEl.textContent = (lastWon ? '✓' : '✗') + ' ' + s;
+      streakEl.style.color = lastWon ? '#00e676' : '#ff3d5a';
+      document.getElementById('streakSub').textContent =
+        lastWon ? s + ' побед подряд' : s + ' проигрышей подряд';
+    }
+
+    // Active bet
+    const ab = d.active_bet;
+    const abEl = document.getElementById('activeBetContent');
+    if (ab) {
+      const abUp = ab.dir === 'UP';
+      const cur = p;
+      const abWin = (abUp && cur > ab.entry) || (!abUp && cur < ab.entry);
+      const abDiff = cur - ab.entry;
+      abEl.innerHTML = `
+        <div class="bet-direction ${abUp ? 'bet-dir-up' : 'bet-dir-dn'}">
+          <div class="bet-arrow" style="color:${abUp ? '#00e676' : '#ff3d5a'}">${abUp ? '↑' : '↓'}</div>
+          <div>
+            <div class="bet-dir-label" style="color:${abUp ? '#00e676' : '#ff3d5a'}">${abUp ? 'ВВЕРХ' : 'ВНИЗ'}</div>
+            <div style="font-size:10px;color:var(--muted)">Ставка #${ab.num} · $5.00</div>
+          </div>
+        </div>
+        <div class="bet-rows">
+          <div class="bet-row"><span class="bet-key">Вход</span><span class="bet-val">$${Math.round(ab.entry).toLocaleString('en-US')}</span></div>
+          <div class="bet-row"><span class="bet-key">Текущая</span><span class="bet-val" style="color:${abWin ? '#00e676' : '#ff3d5a'}">$${Math.round(cur).toLocaleString('en-US')} (${abDiff >= 0 ? '+' : ''}${abDiff.toFixed(0)})</span></div>
+          <div class="bet-row"><span class="bet-key">Слот</span><span class="bet-val">${ab.slot}</span></div>
+        </div>
+        <div class="result-badge ${abWin ? 'result-win' : 'result-loss'}">${abWin ? '✓ ВЫИГРЫВАЕМ' : '✗ ПРОИГРЫВАЕМ'}</div>`;
+    } else {
+      abEl.innerHTML = '<div class="no-bet"><div class="no-bet-icon">◈</div>Нет открытой ставки</div>';
+    }
+
+    // Forecast
+    const a = d.last_analysis || {};
+    if (a.dir) {
+      const aUp = a.dir === 'UP';
+      const fb = document.getElementById('forecastBox');
+      fb.className = 'forecast-big ' + (aUp ? 'up' : 'dn');
+      document.getElementById('forecastArrow').textContent = aUp ? '↑' : '↓';
+      document.getElementById('forecastArrow').style.color = aUp ? '#00e676' : '#ff3d5a';
+      document.getElementById('forecastText').textContent = aUp ? 'ВВЕРХ' : 'ВНИЗ';
+      document.getElementById('forecastText').style.color = aUp ? '#00e676' : '#ff3d5a';
+      document.getElementById('forecastConf').textContent = 'Уверенность: ' + (a.confidence || 0) + '%';
+      const cf = document.getElementById('confFill');
+      cf.style.width = (a.confidence || 50) + '%';
+      cf.className = 'conf-fill ' + (aUp ? 'up' : 'dn');
+
+      const det = a.details || {};
+      document.getElementById('signals').innerHTML = Object.entries(det).map(([k, v]) => {
+        const isUp = v.includes('▲') || v.includes('↗') || v.includes('бычий') || v.includes('перепрод');
+        const isDn = v.includes('▼') || v.includes('↘') || v.includes('медвежий') || v.includes('перекуп');
+        return `<div class="signal-row">
+          <span class="sig-key">${k}</span>
+          <span class="sig-val" style="color:${isUp ? '#00e676' : isDn ? '#ff3d5a' : '#5a6a85'}">${v}</span>
+        </div>`;
+      }).join('');
+    }
+
+  } catch(e) { console.error(e); }
+}
+
+// ── CLOCK + TIMER ────────────────────────────────────────────────────────────
+function tick() {
+  const now = new Date();
+  const msk = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
+  document.getElementById('clock').textContent = msk.toLocaleTimeString('ru-RU');
+
+  // countdown to next 15m slot
+  const sec = Math.floor(Date.now() / 1000);
+  const left = (Math.ceil(sec / 900) * 900) - sec;
+  const m = Math.floor(left / 60), s = left % 60;
+  document.getElementById('tmM').textContent = String(m).padStart(2, '0');
+  document.getElementById('tmS').textContent = String(s).padStart(2, '0');
+}
+
+// ── COMMANDS ─────────────────────────────────────────────────────────────────
+async function sendCmd(cmd) {
+  try {
+    await fetch('/api/cmd/' + cmd, { method: 'POST' });
+    setTimeout(update, 300);
+  } catch(e) { console.error(e); }
+}
+
+initChart();
+update();
+setInterval(update, 1000);
+setInterval(tick, 1000);
+tick();
+</script>
+</body>
+</html>
